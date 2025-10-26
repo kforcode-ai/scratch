@@ -6,11 +6,13 @@ MiniAgent Framework - Simple, powerful agent framework
 from miniagent_framework.core import (
     Agent,
     AgentConfig,
+    AgentFactory,
     Thread,
     Message,
     StreamCallback,
     Event,
     EventType,
+    TelemetryConfig,
 )
 
 from miniagent_framework.core.tools import (
@@ -66,11 +68,13 @@ __all__ = [
     # Core
     "Agent",
     "AgentConfig", 
+    "AgentFactory",
     "Thread",
     "Message",
     "StreamCallback",
     "Event",
     "EventType",
+    "TelemetryConfig",
     # Tools (basic)
     "Tool",
     "SimpleTool",

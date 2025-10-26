@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 import logging
 from dataclasses import dataclass, asdict
 import pickle
+import zlib
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -464,6 +466,145 @@ class RedisSessionManager:
         except Exception as e:
             logger.error(f"Failed to get message: {e}")
             return None
+    
+    # ============== Enhanced Thread Management ==============
+    
+    async def save_thread_enhanced(self, thread) -> bool:
+        """
+        Save thread with events and compression support
+        Note: thread parameter is not typed to avoid circular import
+        """
+        key = f"{self.config.thread_prefix}{thread.id}"
+        
+        try:
+            # Use the thread's serialization method
+            thread_data = thread.to_redis_dict()
+            
+            # Compress events if too many (saves Redis memory)
+            if len(thread_data.get("events", [])) > 100:
+                events_json = json.dumps(thread_data["events"], default=str)
+                compressed = zlib.compress(events_json.encode())
+                thread_data["events_compressed"] = base64.b64encode(compressed).decode()
+                thread_data["events"] = []  # Clear original to save space
+            
+            # Serialize to JSON
+            serialized = json.dumps(thread_data, default=str)
+            
+            # Check size limit
+            if len(serialized.encode()) > self.config.max_session_size:
+                logger.warning(f"Thread {thread.id} exceeds size limit, truncating events")
+                # Keep only last 50 events if too large
+                thread_data["events"] = thread_data.get("events", [])[-50:]
+                serialized = json.dumps(thread_data, default=str)
+            
+            # Get session TTL and apply to thread
+            session_key = f"{self.config.session_prefix}{thread.id}"
+            session_ttl = await self._client.ttl(session_key)
+            if session_ttl > 0:
+                await self._client.setex(key, session_ttl, serialized)
+            else:
+                await self._client.setex(key, self.config.session_ttl, serialized)
+            
+            logger.debug(f"Saved enhanced thread {thread.id} with {len(thread.events)} events")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save enhanced thread {thread.id}: {e}")
+            return False
+    
+    async def load_thread_enhanced(self, thread_id: str):
+        """
+        Load thread with events and decompression support
+        Returns thread object or None
+        """
+        key = f"{self.config.thread_prefix}{thread_id}"
+        
+        try:
+            data = await self._client.get(key)
+            if data:
+                thread_data = json.loads(data)
+                
+                # Decompress events if needed
+                if "events_compressed" in thread_data:
+                    compressed = base64.b64decode(thread_data["events_compressed"])
+                    events_json = zlib.decompress(compressed).decode()
+                    thread_data["events"] = json.loads(events_json)
+                    del thread_data["events_compressed"]
+                
+                # Import Thread class locally to avoid circular import
+                from miniagent_framework.core.core import Thread
+                
+                # Use the Thread's deserialization method
+                thread = Thread.from_redis_dict(thread_data)
+                
+                # Refresh TTL on access
+                await self._client.expire(key, self.config.session_ttl)
+                
+                logger.debug(f"Loaded enhanced thread {thread_id} with {len(thread.events)} events")
+                return thread
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to load enhanced thread {thread_id}: {e}")
+            return None
+    
+    async def get_thread_events(self, thread_id: str, limit: int = 100) -> List[Dict]:
+        """
+        Get just the events from a thread for analysis
+        Useful for debugging and monitoring
+        """
+        thread = await self.load_thread_enhanced(thread_id)
+        if thread:
+            events = thread.events[-limit:] if hasattr(thread, 'events') else []
+            return [e.to_dict() for e in events]
+        return []
+    
+    async def get_thread_checkpoint(self, thread_id: str) -> Optional[Dict]:
+        """
+        Get the latest checkpoint for a thread
+        """
+        thread = await self.load_thread_enhanced(thread_id)
+        if thread and hasattr(thread, '_checkpoints') and thread._checkpoints:
+            return thread._checkpoints[-1]
+        return None
+    
+    async def list_threads(self, pattern: str = "*") -> List[Dict[str, Any]]:
+        """
+        List all threads with basic metadata
+        """
+        try:
+            cursor = 0
+            threads = []
+            match_pattern = f"{self.config.thread_prefix}{pattern}"
+            
+            while True:
+                cursor, keys = await self._client.scan(
+                    cursor, 
+                    match=match_pattern,
+                    count=100
+                )
+                
+                for key in keys:
+                    if isinstance(key, bytes):
+                        key = key.decode('utf-8')
+                    thread_id = key.replace(self.config.thread_prefix, "")
+                    
+                    # Get basic metadata without loading full thread
+                    ttl = await self._client.ttl(key)
+                    threads.append({
+                        "thread_id": thread_id,
+                        "ttl": ttl,
+                        "key": key
+                    })
+                
+                if cursor == 0:
+                    break
+            
+            return threads
+            
+        except Exception as e:
+            logger.error(f"Failed to list threads: {e}")
+            return []
 
 
 # Singleton instance for easy access

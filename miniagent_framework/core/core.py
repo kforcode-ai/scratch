@@ -1,15 +1,26 @@
 """
 Core agent implementation with conversation threads and streaming
 """
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Callable
+from dataclasses import dataclass, field, replace
 import json
 import asyncio
 from datetime import datetime
+import os
+import hashlib
+import logging
 
 from .events import Event, EventType, StreamCallback
 from .llm import LLMClient, RetryPolicy, LLMProvider
 from .tools import ToolRegistry, ToolResult
+from pydantic.dataclasses import dataclass as pydantic_dataclass
+
+# Optional LangFuse integration
+try:
+    from langfuse import Langfuse
+    LANGFUSE_AVAILABLE = True
+except ImportError:
+    LANGFUSE_AVAILABLE = False
 
 
 @dataclass
@@ -36,7 +47,7 @@ class Message:
 
 class Thread:
     """
-    Conversation thread with event history
+    Conversation thread with enhanced event history and checkpointing
     """
     
     def __init__(self, thread_id: Optional[str] = None):
@@ -45,6 +56,8 @@ class Thread:
         self.events: List[Event] = []
         self.metadata: Dict[str, Any] = {}
         self.created_at = datetime.now()
+        self._checkpoint_every = 10  # Auto-checkpoint every N events
+        self._checkpoints: List[Dict] = []  # Store checkpoints
     
     def _generate_id(self) -> str:
         """Generate unique thread ID"""
@@ -52,14 +65,87 @@ class Thread:
         return str(uuid.uuid4())[:8]
     
     def add_message(self, message: Message):
-        """Add a message to the thread"""
+        """Add a message to the thread with event tracking"""
         self.messages.append(message)
+        
+        # Add corresponding event for audit trail
+        event_type = EventType.USER_INPUT if message.role == "user" else EventType.LLM_RESPONSE
+        self.add_event(Event(type=event_type, data=message.to_dict()))
+        
         return self
     
     def add_event(self, event: Event):
-        """Add an event to the history"""
+        """Add an event to the history with auto-checkpointing"""
         self.events.append(event)
+        
+        # Auto-checkpoint for fast recovery
+        if len(self.events) % self._checkpoint_every == 0:
+            self.create_checkpoint()
+        
         return self
+    
+    def create_checkpoint(self) -> Dict:
+        """Create a state snapshot for fast recovery"""
+        checkpoint = {
+            "thread_id": self.id,
+            "timestamp": datetime.now().isoformat(),
+            "message_count": len(self.messages),
+            "event_count": len(self.events),
+            "last_events": [e.to_dict() for e in self.events[-5:]],
+            "state_hash": self._compute_state_hash()
+        }
+        self._checkpoints.append(checkpoint)
+        return checkpoint
+    
+    def _compute_state_hash(self) -> str:
+        """Compute hash of current state for verification"""
+        state_str = json.dumps([e.to_dict() for e in self.events], default=str)
+        return hashlib.md5(state_str.encode()).hexdigest()
+    
+    def to_redis_dict(self) -> Dict:
+        """Serialize thread for Redis storage"""
+        return {
+            "id": self.id,
+            "messages": [m.to_dict() for m in self.messages],
+            "events": [e.to_dict() for e in self.events],
+            "metadata": self.metadata,
+            "created_at": self.created_at.isoformat(),
+            "checkpoints": self._checkpoints
+        }
+    
+    @classmethod
+    def from_redis_dict(cls, data: Dict) -> "Thread":
+        """Deserialize thread from Redis"""
+        thread = cls(thread_id=data["id"])
+        
+        # Restore messages
+        for msg_data in data.get("messages", []):
+            thread.messages.append(Message(
+                role=msg_data["role"],
+                content=msg_data["content"],
+                metadata=msg_data.get("metadata", {}),
+                tool_calls=msg_data.get("tool_calls"),
+                tool_call_id=msg_data.get("tool_call_id")
+            ))
+        
+        # Restore events
+        for event_data in data.get("events", []):
+            # Find the EventType by value, not by name
+            event_type_value = event_data["type"]
+            event_type = None
+            for et in EventType:
+                if et.value == event_type_value:
+                    event_type = et
+                    break
+            if event_type:
+                thread.events.append(Event(
+                    type=event_type,
+                    data=event_data["data"]
+                ))
+        
+        thread.metadata = data.get("metadata", {})
+        thread._checkpoints = data.get("checkpoints", [])
+        return thread
     
     def get_messages_for_llm(self) -> List[Dict]:
         """Get messages formatted for LLM in OpenAI format"""
@@ -81,7 +167,17 @@ class Thread:
         return None
 
 
-@dataclass
+@pydantic_dataclass
+class TelemetryConfig:
+    """Telemetry controls for optional logging/metrics."""
+    enabled: bool = False
+    logger_name: str = "miniagent.telemetry"
+    log_level: int = logging.INFO
+    log_events: bool = True
+    metrics_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
+
+
+@pydantic_dataclass
 class AgentConfig:
     """Agent configuration"""
     name: str = "Assistant"
@@ -93,11 +189,66 @@ class AgentConfig:
     max_tokens: int = 2000
     retry_policy: Optional[RetryPolicy] = None
     stream_by_default: bool = True
+    telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+
+    def __post_init__(self):
+        # Normalize provider naming without breaking legacy configs
+        if self.provider:
+            object.__setattr__(self, "provider", self.provider.lower())
+
+        # Basic guard rails on temperature and token settings
+        if not 0 <= self.temperature <= 2:
+            raise ValueError("temperature must be between 0 and 2 inclusive")
+        if self.max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+
+        # Allow retry_policy to be supplied as plain dict for convenience
+        if isinstance(self.retry_policy, dict):
+            object.__setattr__(self, "retry_policy", RetryPolicy(**self.retry_policy))
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AgentConfig":
+        """Build config from dictionary data."""
+        return cls(**data)
+
+    @classmethod
+    def from_env(cls, prefix: str = "MINIAGENT_", **overrides: Any) -> "AgentConfig":
+        """Construct configuration using environment variables with optional overrides."""
+        env_map = {
+            "name": os.getenv(f"{prefix}NAME"),
+            "system_prompt": os.getenv(f"{prefix}SYSTEM_PROMPT"),
+            "provider": os.getenv(f"{prefix}PROVIDER"),
+            "model": os.getenv(f"{prefix}MODEL"),
+            "api_key": os.getenv(f"{prefix}API_KEY"),
+            "temperature": os.getenv(f"{prefix}TEMPERATURE"),
+            "max_tokens": os.getenv(f"{prefix}MAX_TOKENS"),
+        }
+
+        data: Dict[str, Any] = {k: v for k, v in env_map.items() if v is not None}
+
+        if "temperature" in data:
+            try:
+                data["temperature"] = float(data["temperature"])
+            except ValueError as exc:
+                raise ValueError(f"Invalid temperature value: {data['temperature']}") from exc
+
+        if "max_tokens" in data:
+            try:
+                data["max_tokens"] = int(data["max_tokens"])
+            except ValueError as exc:
+                raise ValueError(f"Invalid max_tokens value: {data['max_tokens']}") from exc
+
+        data.update(overrides)
+        return cls(**data)
+
+    def with_overrides(self, **overrides: Any) -> "AgentConfig":
+        """Return a copy of the config with specific fields replaced."""
+        return replace(self, **overrides)
 
 
 class Agent:
     """
-    Main agent class with tool use and streaming
+    Main agent class with tool use, streaming, and optional LangFuse integration
 
     """
     
@@ -105,17 +256,33 @@ class Agent:
         self,
         config: Optional[AgentConfig] = None,
         tools: Optional[ToolRegistry] = None,
-        callbacks: Optional[StreamCallback] = None
+        callbacks: Optional[StreamCallback] = None,
+        enable_langfuse: bool = True
     ):
         self.config = config or AgentConfig()
         self.tools = tools or ToolRegistry()
         self.callbacks = callbacks or StreamCallback()
+        self.telemetry = self.config.telemetry or TelemetryConfig()
         self.llm = LLMClient(
             provider=self.config.provider,
             api_key=self.config.api_key,
             model=self.config.model,
             retry_policy=self.config.retry_policy
         )
+
+        self._telemetry_logger = None
+        if self.telemetry.enabled:
+            self._telemetry_logger = logging.getLogger(self.telemetry.logger_name)
+            self._telemetry_logger.setLevel(self.telemetry.log_level)
+
+        # Initialize LangFuse if available and enabled
+        self.langfuse = None
+        self.trace = None
+        if enable_langfuse and LANGFUSE_AVAILABLE and os.getenv("LANGFUSE_SECRET_KEY"):
+            try:
+                self.langfuse = Langfuse()
+            except Exception as e:
+                print(f"Warning: Failed to initialize LangFuse: {e}")
     
     async def run(
         self,
@@ -129,21 +296,78 @@ class Agent:
         Main agent execution loop with proper iteration and state management
         Inspired by the agent runtime pattern
         """
-        # Create or use thread
-        if thread is None:
-            thread = Thread()
+        # Start LangFuse trace if available
+        if self.langfuse:
+            self.trace = self.langfuse.trace(
+                name="agent_run",
+                input=user_input,
+                metadata={"thread_id": thread.id if thread else None}
+            )
+        
+        try:
+            # Create or use thread
+            if thread is None:
+                thread = Thread()
 
-        # Add user message
-        thread.add_message(Message("user", user_input))
-        thread.add_event(Event(EventType.USER_INPUT, user_input))
+            # Add user message
+            thread.add_message(Message("user", user_input))
 
-        # Emit user input event
-        await self.callbacks.emit(Event(EventType.USER_INPUT, user_input))
+            self._telemetry_emit(
+                "agent.run.start",
+                {
+                    "thread_id": thread.id,
+                    "stream": stream if stream is not None else self.config.stream_by_default,
+                    "tools_registered": len(self.tools.tools) if hasattr(self.tools, "tools") else None,
+                },
+            )
 
-        # Check if llm client available
-        if self.llm.client is None:
-            raise RuntimeError("No LLM client is configured. Please provide a valid LLM client.")
-        return await self._run(thread, context, stream)
+            # Emit user input event
+            await self.callbacks.emit(Event(EventType.USER_INPUT, user_input))
+
+            # Check if llm client available
+            if self.llm.client is None:
+                raise RuntimeError("No LLM client is configured. Please provide a valid LLM client.")
+            
+            result = await self._run(thread, context, stream)
+            
+            # Update LangFuse trace on success
+            if self.trace:
+                self.trace.update(output=result, level="DEFAULT")
+
+            self._telemetry_emit(
+                "agent.run.success",
+                {
+                    "thread_id": thread.id,
+                    "output_length": len(result) if result else 0,
+                },
+            )
+            return result
+
+        except Exception as e:
+            # Log error to LangFuse
+            if self.trace:
+                self.trace.update(output=str(e), level="ERROR")
+            
+            # Add error event to thread
+            thread.add_event(Event(EventType.ERROR, {"error": str(e)}))
+
+            self._telemetry_emit(
+                "agent.run.error",
+                {
+                    "thread_id": thread.id if "thread" in locals() and thread else None,
+                    "error": str(e),
+                },
+            )
+            raise
+
+    async def invoke(self, *args, **kwargs) -> str:
+        """Alias for run to mirror OpenAI Agent SDK API."""
+        return await self.run(*args, **kwargs)
+
+    async def stream(self, user_input: str, *args, **kwargs) -> str:
+        """Convenience wrapper that enables streaming responses."""
+        kwargs.setdefault("stream", True)
+        return await self.run(user_input, *args, **kwargs)
 
     async def _run(
         self,
@@ -285,11 +509,56 @@ class Agent:
             except Exception as e:
                 error_msg = f"Error in agent loop iteration {iteration}: {str(e)}"
                 await self.callbacks.emit(Event(EventType.ERROR, error_msg))
+                
+                # Add error event for audit trail
+                thread.add_event(Event(EventType.ERROR, {
+                    "error": str(e),
+                    "iteration": iteration,
+                    "type": type(e).__name__
+                }))
+                
+                # Try recovery strategies
+                if "rate_limit" in str(e).lower() and iteration < max_agent_iterations - 1:
+                    wait_time = 2 ** iteration  # Exponential backoff
+                    await asyncio.sleep(wait_time)
+                    continue
+                
+                if "context_length" in str(e).lower() and len(thread.messages) > 10:
+                    # Summarize thread by keeping only recent messages
+                    thread.messages = thread.messages[-5:]
+                    continue
+                
+                # Log to LangFuse if available
+                if self.langfuse:
+                    self.langfuse.trace(
+                        name="error",
+                        input={"error": str(e), "thread_id": thread.id},
+                        level="ERROR"
+                    )
+                
                 return f"Sorry, I encountered an error: {str(e)}"
 
         # Max iterations reached
         return "I apologize, but I couldn't complete the task within the allowed iterations. Please try rephrasing your request."
-    
+
+    def _telemetry_emit(self, event_name: str, payload: Dict[str, Any]) -> None:
+        """Emit optional telemetry without affecting latency when disabled."""
+        if not self.telemetry.enabled:
+            return
+
+        if self.telemetry.log_events and self._telemetry_logger:
+            self._telemetry_logger.log(self.telemetry.log_level, "%s | %s", event_name, payload)
+
+        handler = self.telemetry.metrics_handler
+        if handler is None:
+            return
+
+        try:
+            handler(event_name, payload)
+        except Exception:
+            if self._telemetry_logger:
+                self._telemetry_logger.debug("Telemetry handler failed", exc_info=True)
+
     async def _decide_action(self, thread: Thread, context: Optional[str]) -> Dict:
         """
         Decide what action to take
@@ -475,3 +744,32 @@ Respond with JSON indicating your decision."""
             thread.add_event(Event(EventType.AGENT_RESPONSE, response))
             
             return response
+
+
+class AgentFactory:
+    """Helper for constructing agents from a base configuration."""
+
+    def __init__(self, config: AgentConfig):
+        self.config = config
+
+    def create(
+        self,
+        *,
+        overrides: Optional[Dict[str, Any]] = None,
+        tools: Optional[ToolRegistry] = None,
+        callbacks: Optional[StreamCallback] = None,
+        enable_langfuse: bool = True,
+    ) -> Agent:
+        config = self.config
+        if overrides:
+            config = self.config.with_overrides(**overrides)
+        return Agent(
+            config=config,
+            tools=tools,
+            callbacks=callbacks,
+            enable_langfuse=enable_langfuse,
+        )
+
+    def with_overrides(self, **overrides: Any) -> "AgentFactory":
+        """Create a new factory referencing an updated config."""
+        return AgentFactory(self.config.with_overrides(**overrides))
