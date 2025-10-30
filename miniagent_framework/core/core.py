@@ -9,11 +9,14 @@ from datetime import datetime
 import os
 import hashlib
 import logging
+import re
 
 from .events import Event, EventType, StreamCallback
 from .llm import LLMClient, RetryPolicy, LLMProvider
 from .tools import ToolRegistry, ToolResult
 from pydantic.dataclasses import dataclass as pydantic_dataclass
+
+logger = logging.getLogger(__name__)
 
 # Optional LangFuse integration
 try:
@@ -152,6 +155,8 @@ class Thread:
         formatted_messages = []
         for msg in self.messages:
             msg_dict = msg.to_dict()
+            if msg.metadata.get("internal"):
+                continue
             # Skip internal tool execution markers for APIs
             if msg.role == "assistant" and msg.content.startswith("[Tool:"):
                 continue
@@ -190,6 +195,7 @@ class AgentConfig:
     retry_policy: Optional[RetryPolicy] = None
     stream_by_default: bool = True
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    planning_enabled: bool = False
 
     def __post_init__(self):
         # Normalize provider naming without breaking legacy configs
@@ -280,9 +286,15 @@ class Agent:
         self.trace = None
         if enable_langfuse and LANGFUSE_AVAILABLE and os.getenv("LANGFUSE_SECRET_KEY"):
             try:
-                self.langfuse = Langfuse()
+                candidate = Langfuse()
+                if hasattr(candidate, "trace"):
+                    self.langfuse = candidate
+                else:
+                    logger.warning(
+                        "LangFuse client does not expose trace(); disabling LangFuse integration."
+                    )
             except Exception as e:
-                print(f"Warning: Failed to initialize LangFuse: {e}")
+                logger.warning("Failed to initialize LangFuse: %s", e)
     
     async def run(
         self,
@@ -297,7 +309,7 @@ class Agent:
         Inspired by the agent runtime pattern
         """
         # Start LangFuse trace if available
-        if self.langfuse:
+        if self.langfuse and hasattr(self.langfuse, "trace"):
             self.trace = self.langfuse.trace(
                 name="agent_run",
                 input=user_input,
@@ -311,6 +323,12 @@ class Agent:
 
             # Add user message
             thread.add_message(Message("user", user_input))
+
+            # Reset planning metadata for new request
+            thread.metadata.pop("plan", None)
+            thread.metadata.pop("plan_steps", None)
+            thread.metadata.pop("plan_index", None)
+            thread.metadata.pop("plan_raw", None)
 
             self._telemetry_emit(
                 "agent.run.start",
@@ -327,11 +345,13 @@ class Agent:
             # Check if llm client available
             if self.llm.client is None:
                 raise RuntimeError("No LLM client is configured. Please provide a valid LLM client.")
+
+            await self._ensure_plan(thread, context)
             
             result = await self._run(thread, context, stream)
             
             # Update LangFuse trace on success
-            if self.trace:
+            if self.trace and hasattr(self.trace, "update"):
                 self.trace.update(output=result, level="DEFAULT")
 
             self._telemetry_emit(
@@ -345,7 +365,7 @@ class Agent:
 
         except Exception as e:
             # Log error to LangFuse
-            if self.trace:
+            if self.trace and hasattr(self.trace, "update"):
                 self.trace.update(output=str(e), level="ERROR")
             
             # Add error event to thread
@@ -382,6 +402,7 @@ class Agent:
             try:
                 # Build messages for LLM
                 messages = thread.get_messages_for_llm()
+                stream_enabled = stream if stream is not None else self.config.stream_by_default
 
                 # Debug: show messages being sent to LLM (uncomment for debugging)
                 # if iteration > 0:
@@ -391,20 +412,89 @@ class Agent:
 
                 # Add system prompt for first iteration, or tool result instructions for subsequent iterations
                 if iteration == 0:
+                    system_content = self.config.system_prompt
+                    plan_summary = thread.metadata.get("plan")
+                    plan_steps = thread.metadata.get("plan_steps", [])
+                    if self.config.planning_enabled and plan_summary:
+                        system_content += (
+                            "\n\nPlanned workflow (execute sequentially):\n"
+                            f"{plan_summary}\n"
+                            "For each step: think silently, call the specified tool if listed (or choose the best tool), "
+                            "confirm success criteria, and only then proceed to the next step. Keep the plan hidden from the user."
+                        )
+                    else:
+                        system_content += (
+                            "\n\nBefore responding, outline your approach, reason silently, and verify the final answer before presenting it."
+                        )
+
                     messages.insert(0, {
                         "role": "system",
-                        "content": self.config.system_prompt
+                        "content": system_content
                     })
 
                     # Add context
                     if context:
                         messages.append({"role": "system", "content": f"Context: {context}"})
                 else:
-                    # For subsequent iterations, add instructions about using tool results
-                    messages.insert(0, {
-                        "role": "system",
-                        "content": "You have received tool results. Use the actual data provided in the tool messages to give accurate, direct answers. Do not say you don't have access to data. Extract and summarize the relevant information from the tool results."
-                    })
+                    plan_summary = thread.metadata.get("plan")
+                    plan_steps: List[Dict[str, Any]] = thread.metadata.get("plan_steps", [])
+                    plan_index = thread.metadata.get("plan_index", 0)
+
+                    if self.config.planning_enabled and plan_steps:
+                        if plan_index < len(plan_steps):
+                            current_step = plan_steps[plan_index]
+                            step_instruction = (
+                                f"Current plan step {current_step['position']}: {current_step['description']}. "
+                            )
+                            expected_tool = (current_step.get("tool") or "").strip()
+                            if expected_tool and expected_tool.lower() != "none":
+                                step_instruction += f"Use tool '{expected_tool}' if required to satisfy this step. "
+                            step_instruction += (
+                                "Think through the step internally, call tools as needed, summarize progress, "
+                                "and only advance when the step is satisfied."
+                            )
+                        else:
+                            step_instruction = (
+                                "All planned steps have been addressed. Consolidate the collected evidence and deliver the final answer with supporting details."
+                            )
+
+                        messages.insert(0, {
+                            "role": "system",
+                            "content": step_instruction
+                        })
+
+                        # Keep plan visible as context
+                        messages.insert(0, {
+                            "role": "system",
+                            "content": f"Plan recap:\n{plan_summary}" if plan_summary else "Follow the established plan."
+                        })
+                    else:
+                        # For subsequent iterations without explicit plan, remind about tool integration
+                        if plan_summary:
+                            messages.insert(0, {
+                                "role": "system",
+                                "content": f"Plan recap:\n{plan_summary}"
+                            })
+                        messages.insert(0, {
+                            "role": "system",
+                            "content": (
+                                "You have received tool results. Integrate the tool data, reason step-by-step internally, and only present the concise final answer."
+                            )
+                        })
+
+                thinking_payload: Dict[str, Any] = {"iteration": iteration}
+                if self.config.planning_enabled:
+                    plan_steps = thread.metadata.get("plan_steps", [])
+                    plan_index = thread.metadata.get("plan_index", 0)
+                    if plan_steps and plan_index < len(plan_steps):
+                        current_step = plan_steps[plan_index]
+                        thinking_payload.update({
+                            "stage": "pre_llm",
+                            "current_step": current_step.get("description"),
+                            "step_number": current_step.get("position"),
+                            "expected_tool": current_step.get("tool"),
+                        })
+                await self.callbacks.emit(Event(EventType.AGENT_THINKING, thinking_payload))
 
                 # Emit LLM call event
                 await self.callbacks.emit(Event(EventType.LLM_CALL, {"messages": len(messages), "iteration": iteration}))
@@ -414,7 +504,7 @@ class Agent:
                 if iteration == 0 and self.tools:
                     tools = self.tools.get_schemas()
 
-                if stream and iteration == 0:  # Only stream the first response
+                if stream_enabled:
                     # Stream initial response
                     accumulated = ""
                     tool_calls_detected = []
@@ -463,6 +553,12 @@ class Agent:
                         # Direct response
                         thread.add_message(Message("assistant", accumulated))
                         thread.add_event(Event(EventType.AGENT_RESPONSE, accumulated))
+                        if self.config.planning_enabled:
+                            plan_steps = thread.metadata.get("plan_steps", [])
+                            if plan_steps:
+                                remaining = len(plan_steps) - thread.metadata.get("plan_index", 0)
+                                if remaining > 0:
+                                    self._record_plan_progress(thread, steps_completed=remaining, reason="response_streamed")
                         return accumulated
 
                 else:
@@ -504,6 +600,12 @@ class Agent:
                         content = response if isinstance(response, str) else response.get("content", "")
                         thread.add_message(Message("assistant", content))
                         thread.add_event(Event(EventType.AGENT_RESPONSE, content))
+                        if self.config.planning_enabled:
+                            plan_steps = thread.metadata.get("plan_steps", [])
+                            if plan_steps:
+                                remaining = len(plan_steps) - thread.metadata.get("plan_index", 0)
+                                if remaining > 0:
+                                    self._record_plan_progress(thread, steps_completed=remaining, reason="response_finalized")
                         return content
 
             except Exception as e:
@@ -529,7 +631,7 @@ class Agent:
                     continue
                 
                 # Log to LangFuse if available
-                if self.langfuse:
+                if self.langfuse and hasattr(self.langfuse, "trace"):
                     self.langfuse.trace(
                         name="error",
                         input={"error": str(e), "thread_id": thread.id},
@@ -558,6 +660,194 @@ class Agent:
         except Exception:
             if self._telemetry_logger:
                 self._telemetry_logger.debug("Telemetry handler failed", exc_info=True)
+
+    def _record_plan_progress(
+        self,
+        thread: Thread,
+        steps_completed: int = 1,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Increment plan completion counters and emit progress events."""
+        if not self.config.planning_enabled:
+            return
+
+        plan_steps: List[Dict[str, Any]] = thread.metadata.get("plan_steps") or []
+        if not plan_steps:
+            return
+
+        current_index = thread.metadata.get("plan_index", 0)
+        if current_index >= len(plan_steps):
+            return
+
+        new_index = min(current_index + steps_completed, len(plan_steps))
+        if new_index <= current_index:
+            return
+
+        thread.metadata["plan_index"] = new_index
+        completed_step = plan_steps[new_index - 1]
+
+        progress_payload = {
+            "plan_progress": new_index,
+            "total_steps": len(plan_steps),
+            "completed_step": completed_step.get("description"),
+        }
+        if reason:
+            progress_payload["reason"] = reason
+
+        thread.add_event(Event(EventType.AGENT_THINKING, progress_payload))
+        self._telemetry_emit(
+            "agent.plan.progress",
+            {
+                "thread_id": thread.id,
+                "completed": new_index,
+                "total": len(plan_steps),
+                "reason": reason,
+            },
+        )
+
+    def _coerce_response_text(self, response: Any) -> str:
+        if isinstance(response, str):
+            return response
+        if isinstance(response, dict):
+            if "content" in response:
+                return response["content"]
+            if "text" in response:
+                return response["text"]
+        return str(response)
+
+    def _normalize_plan_steps(self, plan_text: str) -> Optional[List[Dict[str, str]]]:
+        if not plan_text:
+            return None
+
+        steps: List[Dict[str, str]] = []
+
+        # Try to parse JSON structure first
+        try:
+            data = json.loads(plan_text)
+            raw_steps = data.get("steps") if isinstance(data, dict) else None
+            if isinstance(raw_steps, list):
+                for idx, raw_step in enumerate(raw_steps, start=1):
+                    if isinstance(raw_step, dict):
+                        description = (
+                            raw_step.get("description")
+                            or raw_step.get("summary")
+                            or raw_step.get("objective")
+                            or ""
+                        )
+                        tool = raw_step.get("tool") or raw_step.get("tool_name") or ""
+                    else:
+                        description = str(raw_step)
+                        tool = ""
+
+                    description = description.strip()
+                    if not description:
+                        continue
+
+                    steps.append({
+                        "position": idx,
+                        "description": description,
+                        "tool": (tool or "").strip(),
+                    })
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        if steps:
+            return steps
+
+        # Fallback: parse numbered list
+        numbered_pattern = re.compile(r"^\s*(\d+)[\).:-]?\s*(.*)")
+        for line in plan_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            match = numbered_pattern.match(line)
+            if not match:
+                continue
+            description = match.group(2).strip()
+            if not description:
+                continue
+
+            tool = ""
+            tool_match = re.search(r"tool\s*[:=]\s*([A-Za-z0-9_\-]+)", description, re.IGNORECASE)
+            if tool_match:
+                tool = tool_match.group(1)
+
+            steps.append({
+                "position": len(steps) + 1,
+                "description": description,
+                "tool": tool.strip(),
+            })
+
+        return steps or None
+
+    async def _ensure_plan(self, thread: Thread, context: Optional[str]) -> None:
+        if not self.config.planning_enabled or thread.metadata.get("plan"):
+            return
+
+        available_tools: List[str] = []
+        if hasattr(self.tools, "tools") and isinstance(self.tools.tools, dict):
+            available_tools = sorted(self.tools.tools.keys())
+
+        tool_text = ", ".join(available_tools) if available_tools else "web_search, knowledge_base, calculate, get_datetime"
+
+        planning_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a planning assistant for another agent. "
+                    "Break the user's request into a concise ordered plan. "
+                    "Respond ONLY in JSON with the shape: {\"steps\": [{\"description\": str, \"tool\": str|\"none\", \"success\": str}]}. "
+                    "Use available tools: " + tool_text + ". "
+                    "Keep descriptions short but specific, mention the tool the executor should use (or 'none'), "
+                    "and outline clear success criteria for each step."
+                ),
+            }
+        ]
+
+        last_user_message = thread.get_last_user_message() or ""
+        planning_messages.append({"role": "user", "content": last_user_message})
+        if context:
+            planning_messages.append({"role": "system", "content": f"Additional context: {context}"})
+
+        try:
+            plan_response = await self.llm.complete(
+                messages=planning_messages,
+                temperature=max(0.0, self.config.temperature - 0.2),
+                max_tokens=min(512, self.config.max_tokens),
+                tools=None,
+                stream=False,
+            )
+        except Exception as exc:
+            logger.warning("Failed to generate plan: %s", exc)
+            return
+
+        plan_raw = self._coerce_response_text(plan_response).strip()
+        if not plan_raw:
+            return
+
+        normalized_steps = self._normalize_plan_steps(plan_raw)
+        if normalized_steps:
+            summary_lines = []
+            for step in normalized_steps:
+                tool_note = step["tool"].lower()
+                tool_label = f" (Tool: {step['tool']})" if tool_note and tool_note != "none" else ""
+                summary_lines.append(f"{step['position']}. {step['description']}{tool_label}")
+            plan_summary = "\n".join(summary_lines)
+        else:
+            plan_summary = plan_raw
+
+        thread.metadata["plan"] = plan_summary
+        thread.metadata["plan_steps"] = normalized_steps or []
+        thread.metadata["plan_index"] = 0
+        thread.metadata["plan_raw"] = plan_raw
+
+        thread.add_message(Message("assistant", f"[Plan]\n{plan_summary}", metadata={"internal": True, "type": "plan"}))
+        thread.add_event(Event(EventType.AGENT_THINKING, {"plan": plan_summary, "steps": normalized_steps or []}))
+        self._telemetry_emit(
+            "agent.plan.created",
+            {"thread_id": thread.id, "plan_steps": len(normalized_steps or [])},
+        )
+
 
     async def _decide_action(self, thread: Thread, context: Optional[str]) -> Dict:
         """
@@ -595,7 +885,6 @@ Respond with JSON indicating your decision."""
         try:
             if isinstance(response, str):
                 # Try to extract JSON from response
-                import re
                 json_match = re.search(r'\{.*\}', response, re.DOTALL)
                 if json_match:
                     decision = json.loads(json_match.group())
@@ -657,8 +946,14 @@ Respond with JSON indicating your decision."""
                 {"tool": tool_name, "parameters": parameters, "tool_call_id": tool_call_id}
             ))
 
-            # Execute tool
-            result = await self.tools.execute(tool_name, parameters)
+            # Execute tool via registry helpers
+            execute_method = getattr(self.tools, "execute_tool", None)
+            if execute_method is None:
+                execute_method = getattr(self.tools, "execute", None)
+            if execute_method is None:
+                raise AttributeError("Tool registry does not support tool execution")
+
+            result = await execute_method(tool_name, parameters)
 
             # Emit tool result event
             await self.callbacks.emit(Event(
@@ -677,6 +972,28 @@ Respond with JSON indicating your decision."""
                 EventType.TOOL_RESULT,
                 result.to_dict()
             ))
+
+            # Update plan progress heuristically based on tool usage
+            plan_steps: List[Dict[str, Any]] = thread.metadata.get("plan_steps", [])
+            if plan_steps:
+                progress = thread.metadata.get("plan_index", 0)
+                if progress < len(plan_steps):
+                    step = plan_steps[progress]
+                    expected_tool = (step.get("tool") or "").strip().lower()
+                    tool_name_lower = (tool_name or "").strip().lower()
+                    matches_expected = (
+                        not expected_tool
+                        or expected_tool == "none"
+                        or expected_tool == "auto"
+                        or expected_tool in tool_name_lower
+                        or tool_name_lower in expected_tool
+                    )
+                    if matches_expected:
+                        self._record_plan_progress(
+                            thread,
+                            steps_completed=1,
+                            reason=f"tool:{tool_name_lower or 'none'}",
+                        )
     
     async def _generate_response(
         self,

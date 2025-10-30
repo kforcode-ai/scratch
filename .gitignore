@@ -51,3 +51,10 @@ temp/
 tmp/
 *.tmp
 *.bak
+
+# todo
+.todo
+todo*
+
+# plans and analysis
+plan*

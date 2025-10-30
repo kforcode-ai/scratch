@@ -147,8 +147,8 @@ class LLMClient:
         for attempt in range(self.retry_policy.max_retries):
             try:
                 if stream:
-                    # Return the generator directly
-                    return await self._stream_with_retry(
+                    # Return the async generator without awaiting
+                    return self._stream_with_retry(
                         messages, temperature, max_tokens, tools, attempt
                     )
                 else:
@@ -182,13 +182,14 @@ class LLMClient:
     ) -> AsyncIterator:
         """Wrap streaming with retry capability"""
         try:
-            async for chunk in await self.provider.complete(
+            stream_result = await self.provider.complete(
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 tools=tools,
                 stream=True
-            ):
+            )
+            async for chunk in stream_result:
                 yield chunk
         except Exception as e:
             if attempt < self.retry_policy.max_retries - 1:
@@ -196,13 +197,14 @@ class LLMClient:
                 delay = self.retry_policy.get_delay(attempt)
                 await asyncio.sleep(delay)
                 # Retry by calling complete again
-                async for chunk in await self.complete(
+                stream_iter = await self.complete(
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     tools=tools,
                     stream=True
-                ):
+                )
+                async for chunk in stream_iter:
                     yield chunk
             else:
                 raise

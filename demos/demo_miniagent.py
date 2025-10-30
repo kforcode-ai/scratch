@@ -4,6 +4,7 @@ Interactive demo of MiniAgent framework
 import asyncio
 import sys
 import os
+import textwrap
 from dotenv import load_dotenv
 
 # Add parent directory to path to import framework
@@ -85,9 +86,29 @@ All plans include SSL, daily backups, and 99.9% uptime guarantee.""",
     callbacks = StreamCallback()
     
     # Show when agent is thinking
-    callbacks.on(EventType.AGENT_THINKING,
-        lambda e: print(f"💭 Thinking: {e.content.get('action', 'processing...')}")
-    )
+    def thinking_handler(event):
+        content = event.content
+        if isinstance(content, dict):
+            if "plan" in content:
+                print("🗺️ Plan:")
+                print(textwrap.indent(content["plan"], "   "))
+                return
+            if "plan_progress" in content:
+                total = content.get("total_steps")
+                print(f"✅ Plan progress: completed step {content['plan_progress']} of {total}")
+                return
+            if "tool_calls" in content:
+                print("💭 Thinking: analysing tool requirements...")
+                return
+            if "action" in content:
+                print(f"💭 Thinking: {content['action']}")
+                return
+        if isinstance(content, str):
+            print(f"💭 Thinking: {content}")
+        else:
+            print("💭 Thinking: processing...")
+
+    callbacks.on(EventType.AGENT_THINKING, thinking_handler)
     
     # Show tool usage
     callbacks.on(EventType.TOOL_EXECUTION, 
@@ -124,7 +145,8 @@ IMPORTANT: When you receive tool results, use the actual data provided to give a
 
 Use the appropriate tools to provide accurate, helpful responses. For product information (pricing, features, support), use the knowledge_base tool. For web searches, use web_search. For calculations, use calculate. For time/date, use get_datetime.""",
         retry_policy=constant_retry(max_retries=2, delay=0.5),
-        stream_by_default=True  # Enable streaming for better UX
+        stream_by_default=True,  # Enable streaming for better UX
+        planning_enabled=True,
     )
     
     # 4. Create agent and thread for conversation
@@ -133,16 +155,16 @@ Use the appropriate tools to provide accurate, helpful responses. For product in
     
     # 5. Welcome message
     print("\n🎉 Welcome! I'm MiniBot, your AI assistant.")
-    print("I can help with:")
-    print("  • Product information (pricing, features, support)")
-    print("  • Web searches")
-    print("  • Math calculations")
-    print("  • Current date/time")
-    print("\nCommands:")
-    print("  • Type 'quit' or 'exit' to end")
-    print("  • Type 'reset' to clear conversation history")
-    print("  • Type 'help' for this message")
-    print("  • Type 'stream on/off' to toggle streaming")
+    # print("I can help with:")
+    # print("  • Product information (pricing, features, support)")
+    # print("  • Web searches")
+    # print("  • Math calculations")
+    # print("  • Current date/time")
+    # print("\nCommands:")
+    # print("  • Type 'quit' or 'exit' to end")
+    # print("  • Type 'reset' to clear conversation history")
+    # print("  • Type 'help' for this message")
+    # print("  • Type 'stream on/off' to toggle streaming")
     print("-"*60)
 
     stream_enabled = True  # Enable streaming for better UX
