@@ -11,7 +11,12 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from miniagent_framework.core import Agent, AgentConfig, Thread
-from miniagent_framework.core.tools import ToolRegistry, KnowledgeBaseTool, WebSearchTool
+from miniagent_framework.core.tools import (
+    ToolRegistry,
+    KnowledgeBaseTool,
+    WebSearchTool,
+    DateTimeTool,
+)
 from miniagent_framework.core.events import StreamCallback, EventType
 from miniagent_framework.core.llm import constant_retry
 
@@ -62,6 +67,9 @@ All plans include SSL, daily backups, and 99.9% uptime guarantee.""",
     # Add web search tool
     registry.register(WebSearchTool())
     
+    # Add date/time tool
+    registry.register(DateTimeTool())
+    
     # Add a simple custom tool
     @registry.tool(description="Calculate math expressions")
     async def calculate(expression: str):
@@ -76,14 +84,9 @@ All plans include SSL, daily backups, and 99.9% uptime guarantee.""",
         except:
             return "❌ Invalid expression. Try something like: 2+2, 10*5, 100/4"
     
-    @registry.tool(description="Get current date and time")
-    async def get_datetime():
-        from datetime import datetime
-        now = datetime.now()
-        return f"📅 Current date/time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}"
-    
     # 2. Set up callbacks to show what's happening
     callbacks = StreamCallback()
+    stream_state = {"chunks": False}
     
     # Show when agent is thinking
     def thinking_handler(event):
@@ -121,18 +124,26 @@ All plans include SSL, daily backups, and 99.9% uptime guarantee.""",
     )
     
     # Show streaming (print each chunk inline)
-    callbacks.on(EventType.STREAM_CHUNK,
-        lambda e: print(e.content, end="", flush=True)
-    )
-    
-    # New line after streaming ends
-    callbacks.on(EventType.STREAM_END,
-        lambda e: print()  # Just a newline
-    )
+    def stream_start_handler(event):
+        stream_state["chunks"] = False
+
+    def stream_chunk_handler(event):
+        stream_state["chunks"] = True
+        chunk = event.content or ""
+        print(chunk, end="", flush=True)
+
+    def stream_end_handler(event):
+        if stream_state["chunks"]:
+            print()
+
+    callbacks.on(EventType.STREAM_START, stream_start_handler)
+    callbacks.on(EventType.STREAM_CHUNK, stream_chunk_handler)
+    callbacks.on(EventType.STREAM_END, stream_end_handler)
     
     # 3. Configure agent
     config = AgentConfig(
         name="MiniBot",
+        model="gpt-4.1",
         system_prompt="""You are a helpful AI assistant with access to various tools.
 
 Available tools:
@@ -147,6 +158,7 @@ Use the appropriate tools to provide accurate, helpful responses. For product in
         retry_policy=constant_retry(max_retries=2, delay=0.5),
         stream_by_default=True,  # Enable streaming for better UX
         planning_enabled=True,
+
     )
     
     # 4. Create agent and thread for conversation
@@ -212,6 +224,7 @@ Use the appropriate tools to provide accurate, helpful responses. For product in
             print("-"*40)
             print("🤖 MiniBot: ", end="")
             
+            stream_state["chunks"] = False
             response = await agent.run(
                 user_input=user_input,
                 thread=thread,  # Maintain conversation context
@@ -219,8 +232,10 @@ Use the appropriate tools to provide accurate, helpful responses. For product in
             )
 
             # Always display the final response (streaming shows intermediate chunks, but final response might not be streamed)
-            if not stream_enabled or not response.startswith("[TOOL:"):
+            if (not stream_enabled) or (not stream_state["chunks"]):
                 print(response)
+
+            stream_state["chunks"] = False
             
         except KeyboardInterrupt:
             print("\n\n👋 Goodbye!")

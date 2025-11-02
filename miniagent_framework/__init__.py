@@ -12,7 +12,6 @@ from miniagent_framework.core import (
     StreamCallback,
     Event,
     EventType,
-    TelemetryConfig,
 )
 
 from miniagent_framework.core.tools import (
@@ -74,7 +73,6 @@ __all__ = [
     "StreamCallback",
     "Event",
     "EventType",
-    "TelemetryConfig",
     # Tools (basic)
     "Tool",
     "SimpleTool",

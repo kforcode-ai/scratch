@@ -6,13 +6,12 @@ import asyncio
 import redis.asyncio as redis
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
-import logging
 from dataclasses import dataclass, asdict
 import pickle
 import zlib
 import base64
 
-logger = logging.getLogger(__name__)
+from ..core.logging import logger
 
 @dataclass
 class RedisConfig:

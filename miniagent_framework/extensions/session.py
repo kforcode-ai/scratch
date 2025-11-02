@@ -5,14 +5,13 @@ import uuid
 import asyncio
 from typing import Optional, Dict, Any, List
 from datetime import datetime
-import logging
 
-from ..core.core import Agent, Thread, Message, AgentConfig
+from ..core.agent import Agent, AgentConfig
+from ..core.core import Thread, Message
 from .redis_client import RedisSessionManager, RedisConfig, get_redis_manager
 from ..core.events import Event, EventType, StreamCallback
 from ..core.tools import ToolRegistry
-
-logger = logging.getLogger(__name__)
+from ..core.logging import logger
 
 
 class SessionThread(Thread):
@@ -105,11 +104,12 @@ class SessionAgent(Agent):
         callbacks: Optional[StreamCallback] = None,
         redis_config: Optional[RedisConfig] = None
     ):
-        super().__init__(config, tools, callbacks)
+        super().__init__(config=config, tools=tools)
         self.redis_config = redis_config or RedisConfig()
         self.redis_manager: Optional[RedisSessionManager] = None
         self.sessions: Dict[str, SessionThread] = {}
         self._cleanup_task: Optional[asyncio.Task] = None
+        self.callbacks = callbacks or StreamCallback()
     
     async def initialize(self):
         """Initialize Redis connection and start cleanup task"""

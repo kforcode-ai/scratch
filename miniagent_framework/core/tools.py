@@ -7,11 +7,12 @@ from abc import ABC, abstractmethod
 import asyncio
 import json
 import inspect
-import logging
 import aiohttp
 from enum import Enum
+from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-logger = logging.getLogger(__name__)
+from .logging import logger
 
 
 # ============== Core Data Structures ==============
@@ -713,6 +714,85 @@ class WebSearchTool(Tool):
                 error=str(e),
                 display_content=f"❌ Search failed: {str(e)}"
             )
+
+
+class DateTimeTool(Tool):
+    """Retrieve the current date and time with optional timezone formatting."""
+
+    def __init__(self):
+        self.name = "get_datetime"
+        self.description = (
+            "Get the current date and time, optionally providing a timezone or format string."
+        )
+        self.parameters = {
+            "type": "object",
+            "properties": {
+                "timezone": {
+                    "type": "string",
+                    "description": "IANA timezone name (e.g., 'UTC', 'America/New_York')"
+                },
+                "format": {
+                    "type": "string",
+                    "description": (
+                        "Optional strftime-compatible format string to customize the output"
+                    )
+                }
+            },
+            "required": []
+        }
+
+    def get_schema(self) -> Dict:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters
+        }
+
+    async def execute(
+        self,
+        timezone: Optional[str] = None,
+        format: Optional[str] = None
+    ) -> ToolResult:
+        """Return formatted date/time information."""
+        try:
+            if timezone:
+                tz = ZoneInfo(timezone)
+                now = datetime.now(tz)
+            else:
+                now = datetime.now().astimezone()
+        except ZoneInfoNotFoundError:
+            error_msg = f"Unknown timezone: {timezone}"
+            return ToolResult(
+                success=False,
+                error=error_msg,
+                display_content=f"❌ {error_msg}"
+            )
+
+        # Use a friendly default format and fall back to ISO on formatting errors.
+        fmt = format or "%A, %B %d, %Y at %I:%M %p %Z"
+        try:
+            human_readable = now.strftime(fmt)
+        except Exception as exc:
+            error_msg = f"Invalid format string: {exc}"
+            return ToolResult(
+                success=False,
+                error=error_msg,
+                display_content=f"❌ {error_msg}"
+            )
+
+        data = {
+            "iso": now.isoformat(),
+            "human": human_readable,
+            "timezone": now.tzname(),
+            "timestamp": now.timestamp()
+        }
+
+        return ToolResult(
+            success=True,
+            data=data,
+            display_content=f"📅 Current date/time: {human_readable}",
+            llm_content=json.dumps(data)
+        )
 
 
 class KnowledgeBaseTool(Tool):

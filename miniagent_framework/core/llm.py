@@ -2,21 +2,19 @@
 LLM client with support for multiple providers and retry policies
 """
 import asyncio
-import logging
 import time
 from typing import AsyncIterator, Dict, Any, List, Optional, Union, Callable
 from dataclasses import dataclass
 from enum import Enum
 
 # Import provider implementations
+from .logging import logger
 from .providers import (
     BaseLLMProvider,
     OpenAIProvider,
     GeminiProvider,
     AnthropicProvider
 )
-
-logger = logging.getLogger(__name__)
 
 
 # ============== Enums and Configuration ==============
@@ -120,16 +118,42 @@ class LLMClient:
         """
         Complete a chat with retry logic and circuit breaker
         """
+        self._ensure_credentials()
+        logger.info(
+            "llm.complete.call",
+            provider=self.provider_type.value if isinstance(self.provider_type, LLMProvider) else str(self.provider_type),
+            model=self.model,
+            stream=stream,
+            message_count=len(messages),
+            tools=len(tools) if tools else 0,
+        )
         # Wrap with circuit breaker if enabled
         if self.circuit_breaker:
             return await self.circuit_breaker.call(
                 self._complete_with_retry,
                 messages, temperature, max_tokens, tools, stream
             )
-        else:
-            return await self._complete_with_retry(
-                messages, temperature, max_tokens, tools, stream
-            )
+        return await self._complete_with_retry(
+            messages, temperature, max_tokens, tools, stream
+        )
+    
+    def _ensure_credentials(self) -> None:
+        api_key = getattr(self.provider, "api_key", None)
+        if api_key:
+            return
+        hint = {
+            LLMProvider.OPENAI: "Set OPENAI_API_KEY in your environment.",
+            LLMProvider.GEMINI: "Set GOOGLE_API_KEY or GEMINI_API_KEY in your environment.",
+            LLMProvider.GOOGLE: "Set GOOGLE_API_KEY or GEMINI_API_KEY in your environment.",
+            LLMProvider.ANTHROPIC: "Set ANTHROPIC_API_KEY in your environment.",
+            LLMProvider.CLAUDE: "Set ANTHROPIC_API_KEY in your environment.",
+        }.get(self.provider_type, "Provide credentials for the selected LLM provider.")
+        logger.error(
+            "llm.complete.missing_api_key",
+            provider=self.provider_type.value if isinstance(self.provider_type, LLMProvider) else str(self.provider_type),
+            hint=hint,
+        )
+        raise RuntimeError(hint)
     
     async def _complete_with_retry(
         self,
@@ -152,18 +176,38 @@ class LLMClient:
                         messages, temperature, max_tokens, tools, attempt
                     )
                 else:
-                    return await self.provider.complete(
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        tools=tools,
-                        stream=False
-                    )
-            
+                    try:
+                        result = await self.provider.complete(
+                            messages=messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            tools=tools,
+                            stream=False
+                        )
+                        logger.debug("llm.complete.success", stream=False)
+                        return result
+                    except Exception as err:
+                        logger.error(
+                            "llm.complete.error",
+                            error=str(err),
+                            attempt=attempt,
+                            stream=False,
+                            exc_type=type(err).__name__,
+                        )
+                        logger.exception("llm.complete.exception", stream=False)
+                        raise
+
             except Exception as e:
                 last_error = e
-                logger.warning(f"LLM call failed (attempt {attempt + 1}): {e}")
-                
+                logger.warning(
+                    "llm.complete.retry",
+                    attempt=attempt,
+                    remaining=self.retry_policy.max_retries - attempt - 1,
+                    error=str(e),
+                    exc_type=type(e).__name__,
+                )
+                logger.exception("llm.complete.retry_trace")
+
                 if attempt < self.retry_policy.max_retries - 1:
                     delay = self.retry_policy.get_delay(attempt)
                     await asyncio.sleep(delay)
@@ -189,24 +233,37 @@ class LLMClient:
                 tools=tools,
                 stream=True
             )
+            logger.debug("llm.complete.success", stream=True)
             async for chunk in stream_result:
                 yield chunk
         except Exception as e:
             if attempt < self.retry_policy.max_retries - 1:
-                logger.warning(f"Stream failed, retrying: {e}")
+                logger.warning(
+                    "llm.stream.retry",
+                    attempt=attempt,
+                    error=str(e),
+                    exc_type=type(e).__name__,
+                )
+                logger.exception("llm.stream.retry_trace")
                 delay = self.retry_policy.get_delay(attempt)
                 await asyncio.sleep(delay)
-                # Retry by calling complete again
-                stream_iter = await self.complete(
+                # Retry using the next attempt
+                async for chunk in self._stream_with_retry(
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     tools=tools,
-                    stream=True
-                )
-                async for chunk in stream_iter:
+                    attempt=attempt + 1
+                ):
                     yield chunk
             else:
+                logger.error(
+                    "llm.stream.failed",
+                    attempt=attempt,
+                    error=str(e),
+                    exc_type=type(e).__name__,
+                )
+                logger.exception("llm.stream.failed_trace")
                 raise
 
 

@@ -192,6 +192,15 @@ The framework follows a modular architecture:
 3. **Tools Layer** - Reusable tool implementations
 4. **Application Layer** - Your custom implementation
 
+### Agent Loop Internals
+- `Thread` stores the conversation, telemetry events, and optional execution plan metadata.
+- `_prepare_iteration_messages` composes the system prompts, plan guidance, and context before each LLM call.
+- `_call_llm` unifies streaming and non-streaming responses and reports them through the `LLMCallResult` dataclass.
+- `_execute_tools` runs functions requested by the model and automatically advances plan progress.
+- `_complete_remaining_plan_steps` finalizes any outstanding plan items once a user-facing answer is produced.
+
+This flow removes the legacy decision helpers and keeps all routing logic inside the main agent loop, making the code easier to reason about and extend.
+
 ## 🤝 Contributing
 
 1. Keep code simple and readable

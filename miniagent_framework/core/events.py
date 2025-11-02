@@ -7,6 +7,8 @@ from typing import Any, Optional, Dict, Callable, List
 from datetime import datetime
 import asyncio
 
+from .logging import logger
+
 
 class EventType(Enum):
     """Types of events in the agent lifecycle"""
@@ -136,9 +138,11 @@ class StreamCallback:
                     else:
                         handler(event)
                 except Exception as e:
-                    # Log error but don't stop other handlers
-                    import logging
-                    logging.error(f"Error in event handler for {event.type}: {e}")
+                    logger.error(
+                        "Error in event handler",
+                        event_type=event.type.value,
+                        error=str(e),
+                    )
         
         # Call default handler
         if self._default_handler:
@@ -148,8 +152,7 @@ class StreamCallback:
                 else:
                     self._default_handler(event)
             except Exception as e:
-                import logging
-                logging.error(f"Error in default event handler: {e}")
+                logger.error("Error in default event handler", error=str(e))
     
     # Convenience methods for common events
     def on_thinking(self, handler: Callable):

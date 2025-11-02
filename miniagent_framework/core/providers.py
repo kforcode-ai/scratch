@@ -5,11 +5,10 @@ import asyncio
 import json
 import time
 import os
-import logging
+from .logging import logger
 from typing import AsyncIterator, Dict, Any, List, Optional, Union
 from abc import ABC, abstractmethod
 
-logger = logging.getLogger(__name__)
 
 
 # ============== Base Provider Interface ==============
@@ -446,5 +445,4 @@ class AnthropicProvider(BaseLLMProvider):
                             "arguments": json.dumps(event.content_block.input)
                         }]
                     }
-
 

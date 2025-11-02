@@ -1,30 +1,17 @@
 """
-Core agent implementation with conversation threads and streaming
+Conversation primitives for MiniAgent Framework.
 """
-from typing import List, Dict, Any, Optional, Callable
-from dataclasses import dataclass, field, replace
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, field
 import json
-import asyncio
 from datetime import datetime
-import os
 import hashlib
-import logging
-import re
+from pathlib import Path
+import uuid
+import xml.etree.ElementTree as ET
 
-from .events import Event, EventType, StreamCallback
-from .llm import LLMClient, RetryPolicy, LLMProvider
-from .tools import ToolRegistry, ToolResult
-from pydantic.dataclasses import dataclass as pydantic_dataclass
-
-logger = logging.getLogger(__name__)
-
-# Optional LangFuse integration
-try:
-    from langfuse import Langfuse
-    LANGFUSE_AVAILABLE = True
-except ImportError:
-    LANGFUSE_AVAILABLE = False
-
+from .events import Event, EventType
+from .logging import logger
 
 @dataclass
 class Message:
@@ -35,6 +22,7 @@ class Message:
     metadata: Dict[str, Any] = field(default_factory=dict)
     tool_calls: Optional[List[Dict]] = None  # For assistant messages with tool calls
     tool_call_id: Optional[str] = None  # For tool result messages
+    name: Optional[str] = None  # Tool name for tool responses
 
     def to_dict(self) -> Dict:
         result = {
@@ -45,6 +33,8 @@ class Message:
             result["tool_calls"] = self.tool_calls
         if self.tool_call_id:
             result["tool_call_id"] = self.tool_call_id
+        if self.name:
+            result["name"] = self.name
         return result
 
 
@@ -64,17 +54,16 @@ class Thread:
     
     def _generate_id(self) -> str:
         """Generate unique thread ID"""
-        import uuid
         return str(uuid.uuid4())[:8]
     
     def add_message(self, message: Message):
         """Add a message to the thread with event tracking"""
         self.messages.append(message)
-        
+
         # Add corresponding event for audit trail
         event_type = EventType.USER_INPUT if message.role == "user" else EventType.LLM_RESPONSE
         self.add_event(Event(type=event_type, data=message.to_dict()))
-        
+
         return self
     
     def add_event(self, event: Event):
@@ -128,7 +117,8 @@ class Thread:
                 content=msg_data["content"],
                 metadata=msg_data.get("metadata", {}),
                 tool_calls=msg_data.get("tool_calls"),
-                tool_call_id=msg_data.get("tool_call_id")
+                tool_call_id=msg_data.get("tool_call_id"),
+                name=msg_data.get("name"),
             ))
         
         # Restore events
@@ -149,6 +139,104 @@ class Thread:
         thread.metadata = data.get("metadata", {})
         thread._checkpoints = data.get("checkpoints", [])
         return thread
+
+    # ------------------------------------------------------------------
+    # Context utilities inspired by HICA
+    # ------------------------------------------------------------------
+
+    def set_context(self, key: str, value: Any) -> None:
+        """Set a context value in the thread metadata."""
+        self.metadata[key] = value
+        logger.debug("Context updated", extra={"key": key})
+
+    def get_context(self, key: str, default: Any = None) -> Any:
+        """Retrieve a context value from metadata."""
+        return self.metadata.get(key, default)
+
+    def summarize_events(self, max_events: int = 10) -> None:
+        """Truncate stored events keeping only the most recent entries."""
+        if len(self.events) > max_events:
+            self.events = self.events[-max_events:]
+            logger.info("Thread events truncated", extra={"remaining": len(self.events)})
+
+    def awaiting_human_response(self) -> bool:
+        """Return True if the latest event is a clarification request."""
+        if not self.events:
+            return False
+        last = self.events[-1]
+        data = last.data or {}
+        return (
+            last.type == EventType.AGENT_THINKING and
+            isinstance(data, dict) and
+            data.get("intent") == "clarification"
+        )
+
+    # ------------------------------------------------------------------
+    # Serialization helpers
+    # ------------------------------------------------------------------
+
+    def serialize_for_llm(self, fmt: str = "json") -> str:
+        """Serialize thread events for inspection or prompt injection."""
+        context_summary = (
+            f"Thread Context: {json.dumps(self.metadata)}\n\n" if self.metadata else ""
+        )
+
+        def _filter_events() -> List[Event]:
+            filtered: List[Event] = []
+            for event in self.events:
+                if event.type not in {EventType.LLM_CALL}:
+                    filtered.append(event)
+            return filtered
+
+        events = _filter_events()
+
+        if fmt == "xml":
+            serialized = "\n".join(self._serialize_event_xml(e) for e in events)
+        else:
+            serialized = json.dumps([e.to_dict() for e in events], indent=2)
+        return f"{context_summary}{serialized}"
+
+    def _serialize_event_xml(self, event: Event) -> str:
+        root = ET.Element(event.type.value)
+        payload = event.data or {}
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                child = ET.SubElement(root, str(key))
+                child.text = str(value)
+        else:
+            root.text = str(payload)
+        return ET.tostring(root, encoding="unicode", method="xml")
+
+    def to_json(self) -> str:
+        """Serialize thread to a JSON string."""
+        return json.dumps(self.to_redis_dict(), default=str, indent=2)
+
+    @classmethod
+    def from_json(cls, payload: str) -> "Thread":
+        """Deserialize thread from JSON string."""
+        data = json.loads(payload)
+        return cls.from_redis_dict(data)
+
+    def validate(self) -> bool:
+        """Basic validation ensuring events follow the expected structure."""
+        if not self.events:
+            logger.warning("Thread has no events")
+            return False
+        for event in self.events:
+            if not isinstance(event, Event):
+                logger.error("Invalid event object", extra={"event": event})
+                return False
+            if event.data is None and event.content is None:
+                logger.error("Event missing payload", extra={"type": event.type})
+                return False
+        return True
+
+    def save_to_file(self, path: str) -> None:
+        Path(path).write_text(self.to_json())
+
+    @classmethod
+    def load_from_file(cls, path: str) -> "Thread":
+        return cls.from_json(Path(path).read_text())
     
     def get_messages_for_llm(self) -> List[Dict]:
         """Get messages formatted for LLM in OpenAI format"""
@@ -170,923 +258,3 @@ class Thread:
             if msg.role == "user":
                 return msg.content
         return None
-
-
-@pydantic_dataclass
-class TelemetryConfig:
-    """Telemetry controls for optional logging/metrics."""
-    enabled: bool = False
-    logger_name: str = "miniagent.telemetry"
-    log_level: int = logging.INFO
-    log_events: bool = True
-    metrics_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
-
-
-@pydantic_dataclass
-class AgentConfig:
-    """Agent configuration"""
-    name: str = "Assistant"
-    system_prompt: str = "You are a helpful AI assistant."
-    provider: str = "openai"  # "openai", "gemini", "anthropic"
-    model: Optional[str] = None  # Auto-selects default for provider if None
-    api_key: Optional[str] = None  # Provider API key (uses env vars if None)
-    temperature: float = 0.1
-    max_tokens: int = 2000
-    retry_policy: Optional[RetryPolicy] = None
-    stream_by_default: bool = True
-    telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
-    planning_enabled: bool = False
-
-    def __post_init__(self):
-        # Normalize provider naming without breaking legacy configs
-        if self.provider:
-            object.__setattr__(self, "provider", self.provider.lower())
-
-        # Basic guard rails on temperature and token settings
-        if not 0 <= self.temperature <= 2:
-            raise ValueError("temperature must be between 0 and 2 inclusive")
-        if self.max_tokens <= 0:
-            raise ValueError("max_tokens must be positive")
-
-        # Allow retry_policy to be supplied as plain dict for convenience
-        if isinstance(self.retry_policy, dict):
-            object.__setattr__(self, "retry_policy", RetryPolicy(**self.retry_policy))
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "AgentConfig":
-        """Build config from dictionary data."""
-        return cls(**data)
-
-    @classmethod
-    def from_env(cls, prefix: str = "MINIAGENT_", **overrides: Any) -> "AgentConfig":
-        """Construct configuration using environment variables with optional overrides."""
-        env_map = {
-            "name": os.getenv(f"{prefix}NAME"),
-            "system_prompt": os.getenv(f"{prefix}SYSTEM_PROMPT"),
-            "provider": os.getenv(f"{prefix}PROVIDER"),
-            "model": os.getenv(f"{prefix}MODEL"),
-            "api_key": os.getenv(f"{prefix}API_KEY"),
-            "temperature": os.getenv(f"{prefix}TEMPERATURE"),
-            "max_tokens": os.getenv(f"{prefix}MAX_TOKENS"),
-        }
-
-        data: Dict[str, Any] = {k: v for k, v in env_map.items() if v is not None}
-
-        if "temperature" in data:
-            try:
-                data["temperature"] = float(data["temperature"])
-            except ValueError as exc:
-                raise ValueError(f"Invalid temperature value: {data['temperature']}") from exc
-
-        if "max_tokens" in data:
-            try:
-                data["max_tokens"] = int(data["max_tokens"])
-            except ValueError as exc:
-                raise ValueError(f"Invalid max_tokens value: {data['max_tokens']}") from exc
-
-        data.update(overrides)
-        return cls(**data)
-
-    def with_overrides(self, **overrides: Any) -> "AgentConfig":
-        """Return a copy of the config with specific fields replaced."""
-        return replace(self, **overrides)
-
-
-class Agent:
-    """
-    Main agent class with tool use, streaming, and optional LangFuse integration
-
-    """
-    
-    def __init__(
-        self,
-        config: Optional[AgentConfig] = None,
-        tools: Optional[ToolRegistry] = None,
-        callbacks: Optional[StreamCallback] = None,
-        enable_langfuse: bool = True
-    ):
-        self.config = config or AgentConfig()
-        self.tools = tools or ToolRegistry()
-        self.callbacks = callbacks or StreamCallback()
-        self.telemetry = self.config.telemetry or TelemetryConfig()
-        self.llm = LLMClient(
-            provider=self.config.provider,
-            api_key=self.config.api_key,
-            model=self.config.model,
-            retry_policy=self.config.retry_policy
-        )
-
-        self._telemetry_logger = None
-        if self.telemetry.enabled:
-            self._telemetry_logger = logging.getLogger(self.telemetry.logger_name)
-            self._telemetry_logger.setLevel(self.telemetry.log_level)
-
-        # Initialize LangFuse if available and enabled
-        self.langfuse = None
-        self.trace = None
-        if enable_langfuse and LANGFUSE_AVAILABLE and os.getenv("LANGFUSE_SECRET_KEY"):
-            try:
-                candidate = Langfuse()
-                if hasattr(candidate, "trace"):
-                    self.langfuse = candidate
-                else:
-                    logger.warning(
-                        "LangFuse client does not expose trace(); disabling LangFuse integration."
-                    )
-            except Exception as e:
-                logger.warning("Failed to initialize LangFuse: %s", e)
-    
-    async def run(
-        self,
-        user_input: str,
-        thread: Optional[Thread] = None,
-        context: Optional[str] = None,
-        stream: Optional[bool] = None,
-        max_iterations: int = 10
-    ) -> str:
-        """
-        Main agent execution loop with proper iteration and state management
-        Inspired by the agent runtime pattern
-        """
-        # Start LangFuse trace if available
-        if self.langfuse and hasattr(self.langfuse, "trace"):
-            self.trace = self.langfuse.trace(
-                name="agent_run",
-                input=user_input,
-                metadata={"thread_id": thread.id if thread else None}
-            )
-        
-        try:
-            # Create or use thread
-            if thread is None:
-                thread = Thread()
-
-            # Add user message
-            thread.add_message(Message("user", user_input))
-
-            # Reset planning metadata for new request
-            thread.metadata.pop("plan", None)
-            thread.metadata.pop("plan_steps", None)
-            thread.metadata.pop("plan_index", None)
-            thread.metadata.pop("plan_raw", None)
-
-            self._telemetry_emit(
-                "agent.run.start",
-                {
-                    "thread_id": thread.id,
-                    "stream": stream if stream is not None else self.config.stream_by_default,
-                    "tools_registered": len(self.tools.tools) if hasattr(self.tools, "tools") else None,
-                },
-            )
-
-            # Emit user input event
-            await self.callbacks.emit(Event(EventType.USER_INPUT, user_input))
-
-            # Check if llm client available
-            if self.llm.client is None:
-                raise RuntimeError("No LLM client is configured. Please provide a valid LLM client.")
-
-            await self._ensure_plan(thread, context)
-            
-            result = await self._run(thread, context, stream)
-            
-            # Update LangFuse trace on success
-            if self.trace and hasattr(self.trace, "update"):
-                self.trace.update(output=result, level="DEFAULT")
-
-            self._telemetry_emit(
-                "agent.run.success",
-                {
-                    "thread_id": thread.id,
-                    "output_length": len(result) if result else 0,
-                },
-            )
-            return result
-
-        except Exception as e:
-            # Log error to LangFuse
-            if self.trace and hasattr(self.trace, "update"):
-                self.trace.update(output=str(e), level="ERROR")
-            
-            # Add error event to thread
-            thread.add_event(Event(EventType.ERROR, {"error": str(e)}))
-
-            self._telemetry_emit(
-                "agent.run.error",
-                {
-                    "thread_id": thread.id if "thread" in locals() and thread else None,
-                    "error": str(e),
-                },
-            )
-            raise
-
-    async def invoke(self, *args, **kwargs) -> str:
-        """Alias for run to mirror OpenAI Agent SDK API."""
-        return await self.run(*args, **kwargs)
-
-    async def stream(self, user_input: str, *args, **kwargs) -> str:
-        """Convenience wrapper that enables streaming responses."""
-        kwargs.setdefault("stream", True)
-        return await self.run(user_input, *args, **kwargs)
-
-    async def _run(
-        self,
-        thread: Thread,
-        context: Optional[str],
-        stream: Optional[bool],
-        max_agent_iterations: int = 5
-    ) -> str:
-        """Run with LLM API using proper agent loop"""
-
-        for iteration in range(max_agent_iterations):
-            try:
-                # Build messages for LLM
-                messages = thread.get_messages_for_llm()
-                stream_enabled = stream if stream is not None else self.config.stream_by_default
-
-                # Debug: show messages being sent to LLM (uncomment for debugging)
-                # if iteration > 0:
-                #     print(f"DEBUG: Iteration {iteration} - sending {len(messages)} messages to LLM:")
-                #     for i, msg in enumerate(messages[-3:]):  # Show last 3 messages
-                #         print(f"  {len(messages)-3+i}: {msg.get('role', 'unknown')}: {msg.get('content', '')[:100]}...")
-
-                # Add system prompt for first iteration, or tool result instructions for subsequent iterations
-                if iteration == 0:
-                    system_content = self.config.system_prompt
-                    plan_summary = thread.metadata.get("plan")
-                    plan_steps = thread.metadata.get("plan_steps", [])
-                    if self.config.planning_enabled and plan_summary:
-                        system_content += (
-                            "\n\nPlanned workflow (execute sequentially):\n"
-                            f"{plan_summary}\n"
-                            "For each step: think silently, call the specified tool if listed (or choose the best tool), "
-                            "confirm success criteria, and only then proceed to the next step. Keep the plan hidden from the user."
-                        )
-                    else:
-                        system_content += (
-                            "\n\nBefore responding, outline your approach, reason silently, and verify the final answer before presenting it."
-                        )
-
-                    messages.insert(0, {
-                        "role": "system",
-                        "content": system_content
-                    })
-
-                    # Add context
-                    if context:
-                        messages.append({"role": "system", "content": f"Context: {context}"})
-                else:
-                    plan_summary = thread.metadata.get("plan")
-                    plan_steps: List[Dict[str, Any]] = thread.metadata.get("plan_steps", [])
-                    plan_index = thread.metadata.get("plan_index", 0)
-
-                    if self.config.planning_enabled and plan_steps:
-                        if plan_index < len(plan_steps):
-                            current_step = plan_steps[plan_index]
-                            step_instruction = (
-                                f"Current plan step {current_step['position']}: {current_step['description']}. "
-                            )
-                            expected_tool = (current_step.get("tool") or "").strip()
-                            if expected_tool and expected_tool.lower() != "none":
-                                step_instruction += f"Use tool '{expected_tool}' if required to satisfy this step. "
-                            step_instruction += (
-                                "Think through the step internally, call tools as needed, summarize progress, "
-                                "and only advance when the step is satisfied."
-                            )
-                        else:
-                            step_instruction = (
-                                "All planned steps have been addressed. Consolidate the collected evidence and deliver the final answer with supporting details."
-                            )
-
-                        messages.insert(0, {
-                            "role": "system",
-                            "content": step_instruction
-                        })
-
-                        # Keep plan visible as context
-                        messages.insert(0, {
-                            "role": "system",
-                            "content": f"Plan recap:\n{plan_summary}" if plan_summary else "Follow the established plan."
-                        })
-                    else:
-                        # For subsequent iterations without explicit plan, remind about tool integration
-                        if plan_summary:
-                            messages.insert(0, {
-                                "role": "system",
-                                "content": f"Plan recap:\n{plan_summary}"
-                            })
-                        messages.insert(0, {
-                            "role": "system",
-                            "content": (
-                                "You have received tool results. Integrate the tool data, reason step-by-step internally, and only present the concise final answer."
-                            )
-                        })
-
-                thinking_payload: Dict[str, Any] = {"iteration": iteration}
-                if self.config.planning_enabled:
-                    plan_steps = thread.metadata.get("plan_steps", [])
-                    plan_index = thread.metadata.get("plan_index", 0)
-                    if plan_steps and plan_index < len(plan_steps):
-                        current_step = plan_steps[plan_index]
-                        thinking_payload.update({
-                            "stage": "pre_llm",
-                            "current_step": current_step.get("description"),
-                            "step_number": current_step.get("position"),
-                            "expected_tool": current_step.get("tool"),
-                        })
-                await self.callbacks.emit(Event(EventType.AGENT_THINKING, thinking_payload))
-
-                # Emit LLM call event
-                await self.callbacks.emit(Event(EventType.LLM_CALL, {"messages": len(messages), "iteration": iteration}))
-
-                # Get available tools (only in first iteration to avoid loops)
-                tools = []
-                if iteration == 0 and self.tools:
-                    tools = self.tools.get_schemas()
-
-                if stream_enabled:
-                    # Stream initial response
-                    accumulated = ""
-                    tool_calls_detected = []
-
-                    await self.callbacks.emit(Event(EventType.STREAM_START, None))
-
-                    stream_gen = await self.llm.complete(
-                        messages=messages,
-                        temperature=self.config.temperature,
-                        max_tokens=self.config.max_tokens,
-                        tools=tools,
-                        stream=True
-                    )
-
-                    async for chunk in stream_gen:
-                        if isinstance(chunk, dict) and "tool_calls" in chunk:
-                            # Handle tool calls in streaming
-                            tool_calls_detected = chunk["tool_calls"]
-                            await self.callbacks.emit(Event(EventType.AGENT_THINKING, {"tool_calls": tool_calls_detected}))
-                        elif isinstance(chunk, str):
-                            accumulated += chunk
-                            await self.callbacks.emit(Event(EventType.STREAM_CHUNK, chunk))
-
-                    await self.callbacks.emit(Event(EventType.STREAM_END, accumulated))
-
-                    if tool_calls_detected:
-                        # Format and add tool calls to thread
-                        formatted_tool_calls = []
-                        for tc in tool_calls_detected:
-                            formatted_tc = {
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {
-                                    "name": tc["name"],
-                                    "arguments": tc["arguments"]
-                                }
-                            }
-                            formatted_tool_calls.append(formatted_tc)
-
-                        thread.add_message(Message("assistant", accumulated, tool_calls=formatted_tool_calls))
-
-                        # Execute tools
-                        await self._execute_tools(tool_calls_detected, thread)
-                        continue  # Continue to next iteration for final response
-                    else:
-                        # Direct response
-                        thread.add_message(Message("assistant", accumulated))
-                        thread.add_event(Event(EventType.AGENT_RESPONSE, accumulated))
-                        if self.config.planning_enabled:
-                            plan_steps = thread.metadata.get("plan_steps", [])
-                            if plan_steps:
-                                remaining = len(plan_steps) - thread.metadata.get("plan_index", 0)
-                                if remaining > 0:
-                                    self._record_plan_progress(thread, steps_completed=remaining, reason="response_streamed")
-                        return accumulated
-
-                else:
-                    # Non-streaming call (for tool result processing)
-                    response = await self.llm.complete(
-                        messages=messages,
-                        temperature=self.config.temperature,
-                        max_tokens=self.config.max_tokens,
-                        tools=tools,
-                        stream=False
-                    )
-
-                    # Handle tool calls if present
-                    if isinstance(response, dict) and "tool_calls" in response:
-                        # Format tool_calls for OpenAI API
-                        formatted_tool_calls = []
-                        for tc in response["tool_calls"]:
-                            formatted_tc = {
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {
-                                    "name": tc["name"],
-                                    "arguments": tc["arguments"]
-                                }
-                            }
-                            formatted_tool_calls.append(formatted_tc)
-
-                        # Add the assistant message with tool calls to thread
-                        thread.add_message(Message("assistant", response.get("content", ""), tool_calls=formatted_tool_calls))
-                        await self.callbacks.emit(Event(EventType.AGENT_THINKING, {"tool_calls": formatted_tool_calls}))
-
-                        # Execute tools
-                        tool_calls = response["tool_calls"]
-                        await self._execute_tools(tool_calls, thread)
-                        continue  # Continue to next iteration for final response
-
-                    else:
-                        # Final response (no more tool calls)
-                        content = response if isinstance(response, str) else response.get("content", "")
-                        thread.add_message(Message("assistant", content))
-                        thread.add_event(Event(EventType.AGENT_RESPONSE, content))
-                        if self.config.planning_enabled:
-                            plan_steps = thread.metadata.get("plan_steps", [])
-                            if plan_steps:
-                                remaining = len(plan_steps) - thread.metadata.get("plan_index", 0)
-                                if remaining > 0:
-                                    self._record_plan_progress(thread, steps_completed=remaining, reason="response_finalized")
-                        return content
-
-            except Exception as e:
-                error_msg = f"Error in agent loop iteration {iteration}: {str(e)}"
-                await self.callbacks.emit(Event(EventType.ERROR, error_msg))
-                
-                # Add error event for audit trail
-                thread.add_event(Event(EventType.ERROR, {
-                    "error": str(e),
-                    "iteration": iteration,
-                    "type": type(e).__name__
-                }))
-                
-                # Try recovery strategies
-                if "rate_limit" in str(e).lower() and iteration < max_agent_iterations - 1:
-                    wait_time = 2 ** iteration  # Exponential backoff
-                    await asyncio.sleep(wait_time)
-                    continue
-                
-                if "context_length" in str(e).lower() and len(thread.messages) > 10:
-                    # Summarize thread by keeping only recent messages
-                    thread.messages = thread.messages[-5:]
-                    continue
-                
-                # Log to LangFuse if available
-                if self.langfuse and hasattr(self.langfuse, "trace"):
-                    self.langfuse.trace(
-                        name="error",
-                        input={"error": str(e), "thread_id": thread.id},
-                        level="ERROR"
-                    )
-                
-                return f"Sorry, I encountered an error: {str(e)}"
-
-        # Max iterations reached
-        return "I apologize, but I couldn't complete the task within the allowed iterations. Please try rephrasing your request."
-
-    def _telemetry_emit(self, event_name: str, payload: Dict[str, Any]) -> None:
-        """Emit optional telemetry without affecting latency when disabled."""
-        if not self.telemetry.enabled:
-            return
-
-        if self.telemetry.log_events and self._telemetry_logger:
-            self._telemetry_logger.log(self.telemetry.log_level, "%s | %s", event_name, payload)
-
-        handler = self.telemetry.metrics_handler
-        if handler is None:
-            return
-
-        try:
-            handler(event_name, payload)
-        except Exception:
-            if self._telemetry_logger:
-                self._telemetry_logger.debug("Telemetry handler failed", exc_info=True)
-
-    def _record_plan_progress(
-        self,
-        thread: Thread,
-        steps_completed: int = 1,
-        reason: Optional[str] = None,
-    ) -> None:
-        """Increment plan completion counters and emit progress events."""
-        if not self.config.planning_enabled:
-            return
-
-        plan_steps: List[Dict[str, Any]] = thread.metadata.get("plan_steps") or []
-        if not plan_steps:
-            return
-
-        current_index = thread.metadata.get("plan_index", 0)
-        if current_index >= len(plan_steps):
-            return
-
-        new_index = min(current_index + steps_completed, len(plan_steps))
-        if new_index <= current_index:
-            return
-
-        thread.metadata["plan_index"] = new_index
-        completed_step = plan_steps[new_index - 1]
-
-        progress_payload = {
-            "plan_progress": new_index,
-            "total_steps": len(plan_steps),
-            "completed_step": completed_step.get("description"),
-        }
-        if reason:
-            progress_payload["reason"] = reason
-
-        thread.add_event(Event(EventType.AGENT_THINKING, progress_payload))
-        self._telemetry_emit(
-            "agent.plan.progress",
-            {
-                "thread_id": thread.id,
-                "completed": new_index,
-                "total": len(plan_steps),
-                "reason": reason,
-            },
-        )
-
-    def _coerce_response_text(self, response: Any) -> str:
-        if isinstance(response, str):
-            return response
-        if isinstance(response, dict):
-            if "content" in response:
-                return response["content"]
-            if "text" in response:
-                return response["text"]
-        return str(response)
-
-    def _normalize_plan_steps(self, plan_text: str) -> Optional[List[Dict[str, str]]]:
-        if not plan_text:
-            return None
-
-        steps: List[Dict[str, str]] = []
-
-        # Try to parse JSON structure first
-        try:
-            data = json.loads(plan_text)
-            raw_steps = data.get("steps") if isinstance(data, dict) else None
-            if isinstance(raw_steps, list):
-                for idx, raw_step in enumerate(raw_steps, start=1):
-                    if isinstance(raw_step, dict):
-                        description = (
-                            raw_step.get("description")
-                            or raw_step.get("summary")
-                            or raw_step.get("objective")
-                            or ""
-                        )
-                        tool = raw_step.get("tool") or raw_step.get("tool_name") or ""
-                    else:
-                        description = str(raw_step)
-                        tool = ""
-
-                    description = description.strip()
-                    if not description:
-                        continue
-
-                    steps.append({
-                        "position": idx,
-                        "description": description,
-                        "tool": (tool or "").strip(),
-                    })
-        except (json.JSONDecodeError, AttributeError):
-            pass
-
-        if steps:
-            return steps
-
-        # Fallback: parse numbered list
-        numbered_pattern = re.compile(r"^\s*(\d+)[\).:-]?\s*(.*)")
-        for line in plan_text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            match = numbered_pattern.match(line)
-            if not match:
-                continue
-            description = match.group(2).strip()
-            if not description:
-                continue
-
-            tool = ""
-            tool_match = re.search(r"tool\s*[:=]\s*([A-Za-z0-9_\-]+)", description, re.IGNORECASE)
-            if tool_match:
-                tool = tool_match.group(1)
-
-            steps.append({
-                "position": len(steps) + 1,
-                "description": description,
-                "tool": tool.strip(),
-            })
-
-        return steps or None
-
-    async def _ensure_plan(self, thread: Thread, context: Optional[str]) -> None:
-        if not self.config.planning_enabled or thread.metadata.get("plan"):
-            return
-
-        available_tools: List[str] = []
-        if hasattr(self.tools, "tools") and isinstance(self.tools.tools, dict):
-            available_tools = sorted(self.tools.tools.keys())
-
-        tool_text = ", ".join(available_tools) if available_tools else "web_search, knowledge_base, calculate, get_datetime"
-
-        planning_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a planning assistant for another agent. "
-                    "Break the user's request into a concise ordered plan. "
-                    "Respond ONLY in JSON with the shape: {\"steps\": [{\"description\": str, \"tool\": str|\"none\", \"success\": str}]}. "
-                    "Use available tools: " + tool_text + ". "
-                    "Keep descriptions short but specific, mention the tool the executor should use (or 'none'), "
-                    "and outline clear success criteria for each step."
-                ),
-            }
-        ]
-
-        last_user_message = thread.get_last_user_message() or ""
-        planning_messages.append({"role": "user", "content": last_user_message})
-        if context:
-            planning_messages.append({"role": "system", "content": f"Additional context: {context}"})
-
-        try:
-            plan_response = await self.llm.complete(
-                messages=planning_messages,
-                temperature=max(0.0, self.config.temperature - 0.2),
-                max_tokens=min(512, self.config.max_tokens),
-                tools=None,
-                stream=False,
-            )
-        except Exception as exc:
-            logger.warning("Failed to generate plan: %s", exc)
-            return
-
-        plan_raw = self._coerce_response_text(plan_response).strip()
-        if not plan_raw:
-            return
-
-        normalized_steps = self._normalize_plan_steps(plan_raw)
-        if normalized_steps:
-            summary_lines = []
-            for step in normalized_steps:
-                tool_note = step["tool"].lower()
-                tool_label = f" (Tool: {step['tool']})" if tool_note and tool_note != "none" else ""
-                summary_lines.append(f"{step['position']}. {step['description']}{tool_label}")
-            plan_summary = "\n".join(summary_lines)
-        else:
-            plan_summary = plan_raw
-
-        thread.metadata["plan"] = plan_summary
-        thread.metadata["plan_steps"] = normalized_steps or []
-        thread.metadata["plan_index"] = 0
-        thread.metadata["plan_raw"] = plan_raw
-
-        thread.add_message(Message("assistant", f"[Plan]\n{plan_summary}", metadata={"internal": True, "type": "plan"}))
-        thread.add_event(Event(EventType.AGENT_THINKING, {"plan": plan_summary, "steps": normalized_steps or []}))
-        self._telemetry_emit(
-            "agent.plan.created",
-            {"thread_id": thread.id, "plan_steps": len(normalized_steps or [])},
-        )
-
-
-    async def _decide_action(self, thread: Thread, context: Optional[str]) -> Dict:
-        """
-        Decide what action to take
-        """
-        # Build prompt for decision
-        messages = thread.get_messages_for_llm()
-        
-        # Add system prompt
-        system_msg = {
-            "role": "system",
-            "content": f"""{self.config.system_prompt}
-
-You can:
-1. THINK - Internal reasoning (return: {{"action": "think", "content": "your thoughts"}})
-2. USE_TOOLS - Use available tools (return: {{"action": "use_tools", "tools": [...]}})
-3. RESPOND - Direct response (return: {{"action": "respond"}})
-
-Available tools:
-{json.dumps([t.to_function_schema() for t in self.tools.tools.values()], indent=2)}
-
-Respond with JSON indicating your decision."""
-        }
-        
-        decision_messages = [system_msg] + messages
-        
-        # Add context if provided
-        if context:
-            decision_messages.append({"role": "system", "content": f"Context: {context}"})
-        
-        # Get decision
-        response = await self.llm.complete(decision_messages, stream=False)
-        
-        # Parse decision
-        try:
-            if isinstance(response, str):
-                # Try to extract JSON from response
-                json_match = re.search(r'\{.*\}', response, re.DOTALL)
-                if json_match:
-                    decision = json.loads(json_match.group())
-                else:
-                    # Default to respond
-                    decision = {"action": "respond"}
-            elif isinstance(response, dict):
-                decision = response
-            else:
-                # Default to respond for unexpected types
-                decision = {"action": "respond"}
-        except Exception as e:
-            # Log the error for debugging
-            print(f"Decision parsing error: {e}, response: {response}")
-            decision = {"action": "respond"}
-        
-        # Ensure decision is always a dictionary
-        if not isinstance(decision, dict):
-            decision = {"action": "respond"}
-
-        thread.add_event(Event(EventType.AGENT_THINKING, decision))
-        return decision
-    
-    async def _think_and_continue(self, thought: str, thread: Thread, context: Optional[str]) -> str:
-        """Handle thinking step"""
-        # Emit thinking event
-        await self.callbacks.emit(Event(EventType.AGENT_THINKING, thought))
-        
-        # Add thinking to thread
-        thread.add_message(Message("assistant", f"[Thinking: {thought}]"))
-        
-        # Continue with next decision
-        return await self.run(
-            user_input=thread.get_last_user_message() or "",
-            thread=thread,
-            context=context
-        )
-    
-    async def _execute_tools(self, tool_calls: List[Dict], thread: Thread) -> None:
-        """Execute tools and add results to thread in OpenAI format"""
-
-        for tool_call in tool_calls:
-            tool_call_id = tool_call.get("id")
-            tool_name = tool_call.get("name") or tool_call.get("function", {}).get("name")
-            arguments = tool_call.get("arguments") or tool_call.get("function", {}).get("arguments", {})
-
-            # Parse parameters if string
-            if isinstance(arguments, str):
-                try:
-                    parameters = json.loads(arguments)
-                except:
-                    parameters = {}
-            else:
-                parameters = arguments
-
-            # Emit tool execution event
-            await self.callbacks.emit(Event(
-                EventType.TOOL_EXECUTION,
-                {"tool": tool_name, "parameters": parameters, "tool_call_id": tool_call_id}
-            ))
-
-            # Execute tool via registry helpers
-            execute_method = getattr(self.tools, "execute_tool", None)
-            if execute_method is None:
-                execute_method = getattr(self.tools, "execute", None)
-            if execute_method is None:
-                raise AttributeError("Tool registry does not support tool execution")
-
-            result = await execute_method(tool_name, parameters)
-
-            # Emit tool result event
-            await self.callbacks.emit(Event(
-                EventType.TOOL_RESULT,
-                result.to_dict()
-            ))
-
-            # Add tool result message in OpenAI format
-            tool_content = result.llm_content or str(result.data)
-            thread.add_message(Message(
-                role="tool",
-                content=tool_content,
-                tool_call_id=tool_call_id
-            ))
-            thread.add_event(Event(
-                EventType.TOOL_RESULT,
-                result.to_dict()
-            ))
-
-            # Update plan progress heuristically based on tool usage
-            plan_steps: List[Dict[str, Any]] = thread.metadata.get("plan_steps", [])
-            if plan_steps:
-                progress = thread.metadata.get("plan_index", 0)
-                if progress < len(plan_steps):
-                    step = plan_steps[progress]
-                    expected_tool = (step.get("tool") or "").strip().lower()
-                    tool_name_lower = (tool_name or "").strip().lower()
-                    matches_expected = (
-                        not expected_tool
-                        or expected_tool == "none"
-                        or expected_tool == "auto"
-                        or expected_tool in tool_name_lower
-                        or tool_name_lower in expected_tool
-                    )
-                    if matches_expected:
-                        self._record_plan_progress(
-                            thread,
-                            steps_completed=1,
-                            reason=f"tool:{tool_name_lower or 'none'}",
-                        )
-    
-    async def _generate_response(
-        self,
-        thread: Thread,
-        context: Optional[str],
-        stream: Optional[bool] = None
-    ) -> str:
-        """Generate the final response"""
-        
-        stream = stream if stream is not None else self.config.stream_by_default
-        
-        # Build messages
-        messages = thread.get_messages_for_llm()
-        
-        # Add system prompt
-        messages.insert(0, {
-            "role": "system",
-            "content": self.config.system_prompt
-        })
-        
-        # Add context
-        if context:
-            messages.append({"role": "system", "content": f"Context: {context}"})
-        
-        # Emit LLM call event
-        await self.callbacks.emit(Event(EventType.LLM_CALL, {"messages": len(messages)}))
-        
-        if stream:
-            # Stream response
-            accumulated = ""
-            await self.callbacks.emit(Event(EventType.STREAM_START, None))
-            
-            # Get the async generator
-            stream_gen = await self.llm.complete(messages, stream=True)
-            
-            # Iterate over the generator
-            async for chunk in stream_gen:
-                accumulated += chunk
-                await self.callbacks.emit(Event(EventType.STREAM_CHUNK, chunk))
-            
-            await self.callbacks.emit(Event(EventType.STREAM_END, accumulated))
-            
-            # Add to thread
-            thread.add_message(Message("assistant", accumulated))
-            thread.add_event(Event(EventType.AGENT_RESPONSE, accumulated))
-            
-            return accumulated
-        else:
-            # Single response
-            response = await self.llm.complete(messages, stream=False)
-            
-            # Handle tool calls in response
-            if isinstance(response, dict) and response.get("type") == "tool_calls":
-                return await self._use_tools_and_respond(
-                    response["tool_calls"],
-                    thread,
-                    context
-                )
-            
-            # Emit response event
-            await self.callbacks.emit(Event(EventType.LLM_RESPONSE, response))
-            
-            # Add to thread
-            thread.add_message(Message("assistant", response))
-            thread.add_event(Event(EventType.AGENT_RESPONSE, response))
-            
-            return response
-
-
-class AgentFactory:
-    """Helper for constructing agents from a base configuration."""
-
-    def __init__(self, config: AgentConfig):
-        self.config = config
-
-    def create(
-        self,
-        *,
-        overrides: Optional[Dict[str, Any]] = None,
-        tools: Optional[ToolRegistry] = None,
-        callbacks: Optional[StreamCallback] = None,
-        enable_langfuse: bool = True,
-    ) -> Agent:
-        config = self.config
-        if overrides:
-            config = self.config.with_overrides(**overrides)
-        return Agent(
-            config=config,
-            tools=tools,
-            callbacks=callbacks,
-            enable_langfuse=enable_langfuse,
-        )
-
-    def with_overrides(self, **overrides: Any) -> "AgentFactory":
-        """Create a new factory referencing an updated config."""
-        return AgentFactory(self.config.with_overrides(**overrides))
