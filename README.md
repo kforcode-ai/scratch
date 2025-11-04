@@ -169,20 +169,6 @@ config = AgentConfig(
 )
 ```
 
-## 📚 Documentation
-
-- [Core Framework Documentation](docs/README_FRAMEWORK.md)
-- [Redis Session Management](docs/README_REDIS.md)
-- [Future Improvements](docs/improvements.md)
-
-## 🧪 Testing
-
-Run the comprehensive test suite:
-
-```bash
-python tests/test_comprehensive.py
-```
-
 ## 🏗️ Architecture
 
 The framework follows a modular architecture:
@@ -199,7 +185,19 @@ The framework follows a modular architecture:
 - `_execute_tools` runs functions requested by the model and automatically advances plan progress.
 - `_complete_remaining_plan_steps` finalizes any outstanding plan items once a user-facing answer is produced.
 
-This flow removes the legacy decision helpers and keeps all routing logic inside the main agent loop, making the code easier to reason about and extend.
+### Telemetry & Observability Primitives
+
+Every interaction carries structured identifiers so you can trace the agent end-to-end:
+
+| Concept | Purpose | Where to Inspect |
+|---------|---------|------------------|
+| `thread_id` | Conversation/session identifier spanning multiple user turns. | `Thread.id`, event metadata, structured logs |
+| `request_id` | Unique to a single `agent.run(...)` call. Binds plan generation, tool calls, and final response for that user message. | Event metadata, structlog context (auto-bound) |
+| `correlation_id` | Scoped to individual operations within a request (each LLM call, plan attempt, tool execution). | Event metadata, log entries emitted inside the operation scope |
+| `Event` | Structured record (type, timestamp, content, metadata) emitted for every lifecycle change—planning, tool usage, streaming, clarifications, etc. | `Thread.events`, `StreamCallback` handlers |
+| Session | Higher-level conversation container. By default the `Thread` acts as the in-memory session; Redis/SQLite extensions persist it across processes. | `miniagent_framework/core/core.py`, `extensions/session.py` |
+
+Tip: register handlers on `StreamCallback` (or read `Thread.events`) to export telemetry to Prometheus, OpenTelemetry, or your logging pipeline.
 
 ## 🤝 Contributing
 

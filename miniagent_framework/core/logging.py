@@ -5,6 +5,7 @@ import sys
 from typing import Any, Dict
 
 import structlog
+from structlog.contextvars import merge_contextvars
 
 os.environ.setdefault("MINIAGENT_LOG_LEVEL", "INFO")
 _thread_loggers: Dict[str, structlog.BoundLogger] = {}
@@ -27,6 +28,7 @@ def configure_logging() -> structlog.BoundLogger:
     structlog.configure_once(
         processors=[
             structlog.processors.TimeStamper(fmt="iso"),
+            merge_contextvars,
             structlog.stdlib.add_log_level,
             structlog.stdlib.add_logger_name,
             structlog.processors.JSONRenderer(),

@@ -15,14 +15,21 @@ class EventType(Enum):
     # Core events
     USER_INPUT = "user_input"
     AGENT_THINKING = "agent_thinking"
+    PLAN_GENERATING = "plan_generating"
+    PLAN_STEP = "plan_step"
     TOOL_SELECTION = "tool_selection"
     TOOL_EXECUTION = "tool_execution"
+    TOOL_EXECUTION_START = "tool_execution_start"
+    TOOL_EXECUTION_END = "tool_execution_end"
+    TOOL_PROGRESS = "tool_progress"
     TOOL_RESULT = "tool_result"
     AGENT_RESPONSE = "agent_response"
     RETRY = "retry"
     
     # LLM Events
     LLM_CALL = "llm_call"
+    LLM_CALL_START = "llm_call_start"
+    LLM_CALL_END = "llm_call_end"
     LLM_RESPONSE = "llm_response"
     LLM_ERROR = "llm_error"
     LLM_THINKING = "llm_thinking"

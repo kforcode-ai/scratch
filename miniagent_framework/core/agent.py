@@ -1,20 +1,46 @@
 """Lean agent runtime inspired by HICA with hybrid planning/decision flow."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import time
+from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Dict, List, Optional, Literal, Type, Union, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Literal, Type, Union, Tuple, Awaitable
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
+from structlog.contextvars import bind_contextvars, clear_contextvars, get_contextvars, unbind_contextvars
 
 from .core import Message, Thread
 from .events import Event, EventType, StreamCallback
 from .llm import LLMClient, RetryPolicy
 from .logging import logger
 from .tools import ToolRegistry, ToolResult
+
+
+@contextmanager
+def correlation_scope(correlation_id: Optional[str]):
+    """Context manager to bind/unbind correlation id for structured logging."""
+    if not correlation_id:
+        yield
+        return
+    context = get_contextvars()
+    previous = context.get("correlation_id")
+    bind_contextvars(correlation_id=correlation_id)
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                unbind_contextvars("correlation_id")
+            except LookupError:
+                pass
+        else:
+            bind_contextvars(correlation_id=previous)
 
 
 class AgentConfig(BaseModel):
@@ -33,6 +59,9 @@ class AgentConfig(BaseModel):
     max_events_before_summarization: Optional[int] = 20
     planning_enabled: bool = True
     stream_by_default: bool = False
+    tool_timeout: Optional[float] = 30.0
+    llm_timeout: Optional[float] = 60.0
+    planning_required: bool = False
     retry_policy: Optional[RetryPolicy] = None
 
     @model_validator(mode="after")
@@ -42,6 +71,10 @@ class AgentConfig(BaseModel):
             raise ValueError("temperature must be between 0 and 2")
         if self.max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
+        if self.tool_timeout is not None and self.tool_timeout <= 0:
+            raise ValueError("tool_timeout must be positive when set")
+        if self.llm_timeout is not None and self.llm_timeout <= 0:
+            raise ValueError("llm_timeout must be positive when set")
         return self
 
 
@@ -105,6 +138,65 @@ class Agent:
             logger.warning(
                 "LLM client not configured; agent will return fallback responses"
             )
+        self.metrics: Counter[str] = Counter()
+        if os.getenv("MINIAGENT_EVENT_LOG", "0") == "1":
+            self.callbacks.on_any(self._log_event_telemetry)
+
+    def metrics_snapshot(self) -> Dict[str, int]:
+        """Return a shallow copy of collected metrics for external reporting."""
+        return dict(self.metrics)
+
+    def _log_event_telemetry(self, event: Event) -> None:
+        """Optional event sink for debugging/observability."""
+        content = event.content
+        if isinstance(content, str) and len(content) > 500:
+            content = f"{content[:500]}…"
+        logger.debug(
+            "agent.telemetry.event",
+            event_type=event.type.value,
+            metadata=event.metadata,
+            content=content,
+        )
+
+    def _event_metadata(
+        self, request_id: Optional[str] = None, correlation_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {}
+        if request_id:
+            metadata["request_id"] = request_id
+        if correlation_id:
+            metadata["correlation_id"] = correlation_id
+        return metadata
+
+    def _prepare_new_turn(
+        self, thread: Thread, message: Message, *, request_id: Optional[str] = None
+    ) -> None:
+        """Reset per-turn state such as planning metadata."""
+        last_planned_ts = thread.metadata.get("plan_message_ts")
+        current_ts = message.timestamp.isoformat()
+        thread.metadata["current_user_message_ts"] = current_ts
+        thread.metadata["last_request_id"] = request_id
+        if not thread.metadata.get("plan") or last_planned_ts != current_ts:
+            self._reset_plan_state(thread)
+
+    def _reset_plan_state(self, thread: Thread) -> None:
+        """Clear plan metadata so a fresh plan can be generated."""
+        for key in ("plan", "plan_steps", "plan_index", "plan_parser", "plan_raw"):
+            thread.metadata.pop(key, None)
+        thread.metadata["plan_message_ts"] = None
+
+    async def _await_with_timeout(
+        self,
+        coro: Awaitable[Any],
+        timeout: Optional[float],
+        timeout_message: str,
+    ) -> Any:
+        if timeout is None:
+            return await coro
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(timeout_message) from exc
 
     async def run(
         self,
@@ -117,47 +209,76 @@ class Agent:
         thread = thread or Thread()
         if stream is None:
             stream = self.config.stream_by_default
-        logger.info(
-            "agent.run.start",
-            user_input=user_input,
-            thread_id=thread.id,
-            stream=stream,
-        )
-        message = Message("user", user_input)
-        thread.add_message(message)
-
+        request_id = uuid4().hex[:8]
         try:
+            bind_contextvars(request_id=request_id, thread_id=thread.id)
+            run_logger = logger.bind(request_id=request_id, thread_id=thread.id)
+            run_logger.info(
+                "agent.run.start",
+                user_input=user_input,
+                stream=stream,
+            )
+            message = Message("user", user_input, metadata={"request_id": request_id})
+            thread.add_message(message)
+            self._prepare_new_turn(thread, message, request_id=request_id)
+            start_event = Event(
+                EventType.AGENT_START,
+                {"thread_id": thread.id, "user_input": user_input},
+                metadata={"request_id": request_id},
+            )
+            thread.add_event(start_event)
+            await self.callbacks.emit(start_event)
+
             async for _ in self.agent_loop(
                 thread,
                 context=context,
                 stream=stream,
                 max_iterations=max_iterations,
+                request_id=request_id,
             ):
                 pass
         except Exception as exc:
-            logger.error(
+            run_logger = logger.bind(request_id=request_id, thread_id=thread.id)
+            run_logger.error(
                 "agent.run.exception",
                 error=str(exc),
                 exc_type=type(exc).__name__,
-                thread_id=thread.id,
             )
             logger.exception("agent.run.exception_trace")
-            thread.add_event(Event(EventType.ERROR, {"error": str(exc)}))
+            error_event = Event(
+                EventType.ERROR,
+                {"error": str(exc)},
+                metadata={"request_id": request_id},
+            )
+            thread.add_event(error_event)
+            await self.callbacks.emit(error_event)
             if isinstance(exc, RuntimeError):
                 fallback = f"Configuration issue: {exc}"
             else:
                 fallback = "I'm sorry, I ran into an internal error while responding."
-            thread.add_event(Event(EventType.AGENT_RESPONSE, fallback))
-            await self.callbacks.emit(Event(EventType.AGENT_RESPONSE, fallback))
+            response_event = Event(
+                EventType.AGENT_RESPONSE,
+                fallback,
+                metadata={"request_id": request_id},
+            )
+            thread.add_event(response_event)
+            await self.callbacks.emit(response_event)
             return fallback
+        finally:
+            clear_contextvars()
 
         for event in reversed(thread.events):
             if event.type == EventType.AGENT_RESPONSE and isinstance(event.data, str):
                 return event.data
 
         fallback = "I'm sorry, I couldn't produce an answer this time."
-        thread.add_event(Event(EventType.AGENT_RESPONSE, fallback))
-        await self.callbacks.emit(Event(EventType.AGENT_RESPONSE, fallback))
+        response_event = Event(
+            EventType.AGENT_RESPONSE,
+            fallback,
+            metadata={"request_id": request_id},
+        )
+        thread.add_event(response_event)
+        await self.callbacks.emit(response_event)
         logger.warning(
             "agent.final_response_missing",
             thread_id=thread.id,
@@ -171,6 +292,7 @@ class Agent:
         context: Optional[str] = None,
         stream: Optional[bool] = None,
         max_iterations: int = 5,
+        request_id: Optional[str] = None,
     ) -> AsyncGenerator[Thread, None]:
         if (
             self.config.max_events_before_summarization
@@ -183,13 +305,16 @@ class Agent:
             yield thread
             return
 
-        await self._ensure_plan(thread, context)
+        await self._ensure_plan(thread, context, request_id=request_id)
         yield thread
 
         use_stream = bool(stream)
+        thread.metadata["last_request_id"] = request_id
 
         for iteration in range(max_iterations):
-            action = await self._decide_next_action(thread, context, iteration, use_stream)
+            action = await self._decide_next_action(
+                thread, context, iteration, use_stream, request_id=request_id
+            )
 
             if action.action == "tool" and action.tool:
                 if action.message:
@@ -197,6 +322,7 @@ class Agent:
                         Event(
                             EventType.AGENT_THINKING,
                             {"tool": action.tool, "note": action.message},
+                            metadata={"request_id": request_id},
                         )
                     )
                 await self._execute_tool(
@@ -204,6 +330,7 @@ class Agent:
                     action.arguments or {},
                     thread,
                     call_id=action.tool_call_id,
+                    request_id=request_id,
                 )
                 yield thread
                 continue
@@ -211,8 +338,13 @@ class Agent:
             if action.action == "clarification" and action.message:
                 clarification_msg = action.message
                 thread.add_message(Message("assistant", clarification_msg))
-                thread.add_event(Event(EventType.AGENT_RESPONSE, clarification_msg))
-                await self.callbacks.emit(Event(EventType.AGENT_RESPONSE, clarification_msg))
+                clarification_event = Event(
+                    EventType.AGENT_RESPONSE,
+                    clarification_msg,
+                    metadata={"request_id": request_id, "intent": "clarification"},
+                )
+                thread.add_event(clarification_event)
+                await self.callbacks.emit(clarification_event)
                 logger.info(
                     "agent.clarification_requested",
                     message=clarification_msg,
@@ -222,12 +354,19 @@ class Agent:
                 return
 
             if action.action == "final" and action.message:
-                await self._commit_final_response(action.message, action.summary, thread)
+                await self._commit_final_response(
+                    action.message, action.summary, thread, request_id=request_id
+                )
                 yield thread
                 return
 
             if action.action == "fallback":
-                await self._commit_final_response(action.message or "", action.summary, thread)
+                await self._finalize_response(
+                    thread,
+                    context,
+                    request_id=request_id,
+                    fallback_message=action.message,
+                )
                 yield thread
                 return
 
@@ -236,12 +375,12 @@ class Agent:
                 action=action.action,
                 thread_id=thread.id,
             )
-            await self._finalize_response(thread, context)
+            await self._finalize_response(thread, context, request_id=request_id)
             yield thread
             return
 
         logger.warning("Max iterations reached without completion", thread_id=thread.id)
-        await self._finalize_response(thread, context)
+        await self._finalize_response(thread, context, request_id=request_id)
         yield thread
 
     # ------------------------------------------------------------------
@@ -253,60 +392,103 @@ class Agent:
         messages: List[Dict[str, Any]],
         response_model: Type[BaseModel],
         thread: Optional[Thread] = None,
+        request_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
     ) -> BaseModel:
-        await self.callbacks.emit(Event(EventType.LLM_CALL, {"messages": len(messages)}))
-        logger.debug(
-            "agent.llm.request",
-            message_count=len(messages),
-            last_user_message=next(
-                (m["content"] for m in reversed(messages) if m.get("role") == "user"),
-                None,
-            ),
-            thread_id=thread.id if thread else None,
-        )
+        correlation = correlation_id or uuid4().hex[:8]
+        with correlation_scope(correlation):
+            llm_start = Event(
+                EventType.LLM_CALL_START,
+                {"messages": len(messages)},
+                metadata=self._event_metadata(request_id, correlation),
+            )
+            if thread:
+                thread.add_event(llm_start)
+            await self.callbacks.emit(llm_start)
 
-        raw = await self.llm.complete(
-            messages=messages,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-            stream=False,
-            tools=None,
-        )
+            logger.debug(
+                "agent.llm.request",
+                message_count=len(messages),
+                last_user_message=next(
+                    (m["content"] for m in reversed(messages) if m.get("role") == "user"),
+                    None,
+                ),
+                thread_id=thread.id if thread else None,
+            )
 
-        if isinstance(raw, dict):
-            payload = json.dumps(raw)
-        else:
-            payload = str(raw)
+            start_time = time.perf_counter()
+            try:
+                raw = await self._await_with_timeout(
+                    self.llm.complete(
+                        messages=messages,
+                        temperature=self.config.temperature,
+                        max_tokens=self.config.max_tokens,
+                        stream=False,
+                        tools=None,
+                    ),
+                    self.config.llm_timeout,
+                    "LLM request timed out",
+                )
+            except Exception as exc:
+                duration_ms = int((time.perf_counter() - start_time) * 1000)
+                error_event = Event(
+                    EventType.LLM_ERROR,
+                    {"error": str(exc), "duration_ms": duration_ms},
+                    metadata=self._event_metadata(request_id, correlation),
+                )
+                if thread:
+                    thread.add_event(error_event)
+                await self.callbacks.emit(error_event)
+                self.metrics["llm_error_total"] += 1
+                raise
 
-        payload = payload.strip()
-        if not payload:
-            raise ValueError("Empty response from LLM")
+            if isinstance(raw, dict):
+                payload = json.dumps(raw)
+            else:
+                payload = str(raw)
 
-        logger.debug(
-            "agent.llm.raw_response",
-            payload_preview=payload[:500],
-            payload_length=len(payload),
-            thread_id=thread.id if thread else None,
-        )
+            payload = payload.strip()
+            if not payload:
+                raise ValueError("Empty response from LLM")
 
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            logger.error("Failed to parse LLM JSON", error=str(exc), payload=payload)
-            raise
+            logger.debug(
+                "agent.llm.raw_response",
+                payload_preview=payload[:500],
+                payload_length=len(payload),
+                thread_id=thread.id if thread else None,
+            )
 
-        try:
-            validated = response_model.model_validate(data)
-        except ValidationError as exc:
-            logger.error("Response validation failed", error=str(exc), payload=data)
-            raise
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                logger.error("Failed to parse LLM JSON", error=str(exc), payload=payload)
+                raise
 
-        logger.debug(
-            "agent.llm.validated_response",
-            model=response_model.__name__,
-            thread_id=thread.id if thread else None,
-        )
-        return validated
+            try:
+                validated = response_model.model_validate(data)
+            except ValidationError as exc:
+                logger.error("Response validation failed", error=str(exc), payload=data)
+                raise
+
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            llm_end = Event(
+                EventType.LLM_CALL_END,
+                {"model": response_model.__name__, "duration_ms": duration_ms},
+                metadata=self._event_metadata(request_id, correlation),
+            )
+            if thread:
+                thread.add_event(llm_end)
+            await self.callbacks.emit(llm_end)
+
+            logger.debug(
+                "agent.llm.validated_response",
+                model=response_model.__name__,
+                duration_ms=duration_ms,
+                thread_id=thread.id if thread else None,
+            )
+            self.metrics["llm_call_total"] += 1
+            self.metrics["llm_call_duration_ms_total"] += duration_ms
+            return validated
 
     async def _decide_next_action(
         self,
@@ -314,6 +496,7 @@ class Agent:
         context: Optional[str],
         iteration: int,
         stream: bool,
+        request_id: Optional[str] = None,
     ) -> ActionResult:
         pending_call = self._pop_next_tool_call(thread)
         if pending_call:
@@ -324,13 +507,24 @@ class Agent:
                 thread_id=thread.id,
                 source="pending_queue",
             )
+            tool_selection_event = Event(
+                EventType.TOOL_SELECTION,
+                {
+                    "tool": pending_call["name"],
+                    "arguments": pending_call["arguments"],
+                    "source": "pending_queue",
+                },
+                metadata=self._event_metadata(request_id, pending_call.get("id")),
+            )
+            thread.add_event(tool_selection_event)
+            await self.callbacks.emit(tool_selection_event)
             return ActionResult(
                 action="tool",
                 tool=pending_call["name"],
                 arguments=pending_call["arguments"],
                 tool_call_id=pending_call["id"],
                 message=pending_call.get("note"),
-            )
+        )
 
         instruction = (
             "Review the conversation and the current plan. "
@@ -342,36 +536,80 @@ class Agent:
         messages = self._build_messages(
             instruction, thread, context, iteration, mode="decision"
         )
-        await self.callbacks.emit(Event(EventType.LLM_CALL, {"messages": len(messages)}))
-        logger.debug(
-            "agent.decision.request",
-            thread_id=thread.id,
-            iteration=iteration,
-        )
-
-        tool_schemas = (
-            self.tool_registry.get_schemas() if self.tool_registry.tools else None
-        )
-
-        if stream:
-            tool_calls_payload, final_text = await self._stream_decision_response(
-                messages, tool_schemas, thread
+        decision_correlation = uuid4().hex[:8]
+        tool_calls_payload: Optional[List[Dict[str, Any]]] = None
+        final_text: Optional[str] = None
+        with correlation_scope(decision_correlation):
+            llm_start = Event(
+                EventType.LLM_CALL_START,
+                {"messages": len(messages), "phase": "decision"},
+                metadata=self._event_metadata(request_id, decision_correlation),
             )
-        else:
-            raw_response = await self.llm.complete(
-                messages=messages,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-                stream=False,
-                tools=tool_schemas,
-            )
+            thread.add_event(llm_start)
+            await self.callbacks.emit(llm_start)
             logger.debug(
-                "agent.decision.raw_response",
+                "agent.decision.request",
                 thread_id=thread.id,
-                response=str(raw_response)[:500],
+                iteration=iteration,
             )
-            tool_calls_payload = self._extract_tool_calls(raw_response)
-            final_text = self._extract_text_response(raw_response)
+
+            tool_schemas = (
+                self.tool_registry.get_schemas() if self.tool_registry.tools else None
+            )
+
+            decision_start = time.perf_counter()
+            duration_ms = None
+            try:
+                if stream:
+                    tool_calls_payload, final_text = await self._stream_decision_response(
+                        messages,
+                        tool_schemas,
+                        thread,
+                        request_id=request_id,
+                        correlation_id=decision_correlation,
+                    )
+                else:
+                    raw_response = await self._await_with_timeout(
+                        self.llm.complete(
+                            messages=messages,
+                            temperature=self.config.temperature,
+                            max_tokens=self.config.max_tokens,
+                            stream=False,
+                            tools=tool_schemas,
+                        ),
+                        self.config.llm_timeout,
+                        "LLM decision timed out",
+                    )
+                    logger.debug(
+                        "agent.decision.raw_response",
+                        thread_id=thread.id,
+                        response=str(raw_response)[:500],
+                    )
+                    tool_calls_payload = self._extract_tool_calls(raw_response)
+                    final_text = self._extract_text_response(raw_response)
+            except Exception as exc:
+                duration_ms = int((time.perf_counter() - decision_start) * 1000)
+                error_event = Event(
+                    EventType.LLM_ERROR,
+                    {"error": str(exc), "phase": "decision", "duration_ms": duration_ms},
+                    metadata=self._event_metadata(request_id, decision_correlation),
+                )
+                thread.add_event(error_event)
+                await self.callbacks.emit(error_event)
+                self.metrics["llm_error_total"] += 1
+                raise
+            finally:
+                if duration_ms is None:
+                    duration_ms = int((time.perf_counter() - decision_start) * 1000)
+                llm_end = Event(
+                    EventType.LLM_CALL_END,
+                    {"phase": "decision", "duration_ms": duration_ms},
+                    metadata=self._event_metadata(request_id, decision_correlation),
+                )
+                thread.add_event(llm_end)
+                await self.callbacks.emit(llm_end)
+                self.metrics["llm_call_total"] += 1
+                self.metrics["llm_call_duration_ms_total"] += duration_ms
 
         if tool_calls_payload:
             formatted_calls, pending_calls = self._prepare_tool_calls(tool_calls_payload)
@@ -397,17 +635,17 @@ class Agent:
                         tool=next_call["name"],
                         thread_id=thread.id,
                     )
-                    await self.callbacks.emit(
-                        Event(
-                            EventType.LLM_RESPONSE,
-                            {
-                                "action": "tool",
-                                "tool": next_call["name"],
-                                "arguments": next_call["arguments"],
-                                "tool_call_id": next_call["id"],
-                            },
-                        )
+                    selection_event = Event(
+                        EventType.TOOL_SELECTION,
+                        {
+                            "tool": next_call["name"],
+                            "arguments": next_call["arguments"],
+                            "tool_call_id": next_call["id"],
+                        },
+                        metadata=self._event_metadata(request_id, next_call.get("id")),
                     )
+                    thread.add_event(selection_event)
+                    await self.callbacks.emit(selection_event)
                     return ActionResult(
                         action="tool",
                         tool=next_call["name"],
@@ -420,46 +658,51 @@ class Agent:
                 payload=tool_calls_payload,
             )
 
-        if final_text is None or not str(final_text).strip():
+        action_result = self._parse_final_action(final_text)
+        if action_result.action == "fallback":
             logger.warning(
-                "agent.decision.empty_response",
+                "agent.decision.unstructured_response",
                 thread_id=thread.id,
                 iteration=iteration,
             )
-            return ActionResult(
-                action="fallback",
-                message="I'm sorry, I wasn't able to generate a response just now.",
-            )
-
-        thread.add_event(
-            Event(
+        else:
+            response_event = Event(
                 EventType.LLM_RESPONSE,
-                {"action": "final", "message": final_text},
+                {
+                    "action": action_result.action,
+                    "message": action_result.message,
+                    "summary": action_result.summary,
+                },
+                metadata=self._event_metadata(request_id, decision_correlation),
             )
-        )
-        await self.callbacks.emit(
-            Event(EventType.LLM_RESPONSE, {"action": "final", "message": final_text})
-        )
+            thread.add_event(response_event)
+            await self.callbacks.emit(response_event)
         logger.info(
             "agent.intent.selected",
-            action="final",
+            action=action_result.action,
             tool=None,
             thread_id=thread.id,
         )
-        return ActionResult(action="final", message=final_text)
+        return action_result
 
     async def _stream_decision_response(
         self,
         messages: List[Dict[str, Any]],
         tool_schemas: Optional[List[Dict[str, Any]]],
         thread: Thread,
+        request_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], str]:
-        stream_iter = await self.llm.complete(
-            messages=messages,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-            stream=True,
-            tools=tool_schemas,
+        stream_iter = await self._await_with_timeout(
+            self.llm.complete(
+                messages=messages,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+                stream=True,
+                tools=tool_schemas,
+            ),
+            self.config.llm_timeout,
+            "LLM streaming request timed out",
         )
 
         chunks: List[str] = []
@@ -470,9 +713,21 @@ class Agent:
             if isinstance(chunk, str):
                 if not stream_started:
                     stream_started = True
-                    await self.callbacks.emit(Event(EventType.STREAM_START, None))
+                    await self.callbacks.emit(
+                        Event(
+                            EventType.STREAM_START,
+                            None,
+                            metadata=self._event_metadata(request_id, correlation_id),
+                        )
+                    )
                 chunks.append(chunk)
-                await self.callbacks.emit(Event(EventType.STREAM_CHUNK, chunk))
+                await self.callbacks.emit(
+                    Event(
+                        EventType.STREAM_CHUNK,
+                        chunk,
+                        metadata=self._event_metadata(request_id, correlation_id),
+                    )
+                )
             elif isinstance(chunk, dict):
                 extracted = self._extract_tool_calls(chunk)
                 if extracted:
@@ -485,7 +740,13 @@ class Agent:
                 )
 
         if stream_started:
-            await self.callbacks.emit(Event(EventType.STREAM_END, None))
+            await self.callbacks.emit(
+                Event(
+                    EventType.STREAM_END,
+                    None,
+                    metadata=self._event_metadata(request_id, correlation_id),
+                )
+            )
 
         final_text = "".join(chunks)
         if final_text:
@@ -496,6 +757,71 @@ class Agent:
             )
 
         return tool_calls, final_text
+
+    def _parse_final_action(self, final_text: Any) -> ActionResult:
+        if final_text is None:
+            return ActionResult(
+                action="fallback",
+                message="I'm sorry, I wasn't able to generate a response just now.",
+            )
+
+        raw_payload: Optional[Dict[str, Any]] = None
+        clarification_requested = False
+        serialized_text = ""
+
+        if isinstance(final_text, FinalResponseModel):
+            raw_payload = final_text.model_dump(exclude_none=True)
+        elif isinstance(final_text, dict):
+            raw_payload = final_text
+        else:
+            serialized_text = str(final_text).strip()
+            if not serialized_text:
+                return ActionResult(
+                    action="fallback",
+                    message="I'm sorry, I wasn't able to generate a response just now.",
+                )
+            try:
+                raw_payload = json.loads(serialized_text)
+            except json.JSONDecodeError:
+                json_match = re.search(
+                    r"```(?:json)?\s*(\{.*\})\s*```", serialized_text, re.DOTALL
+                )
+                if json_match:
+                    try:
+                        raw_payload = json.loads(json_match.group(1))
+                    except json.JSONDecodeError:
+                        raw_payload = None
+
+        if isinstance(raw_payload, dict):
+            clarification_requested = bool(raw_payload.get("clarification"))
+
+        if raw_payload is None:
+            return ActionResult(
+                action="fallback",
+                message="",
+            )
+
+        try:
+            validated = FinalResponseModel.model_validate(raw_payload)
+        except ValidationError:
+            return ActionResult(action="fallback", message="")
+
+        message_content = validated.message
+        if isinstance(message_content, dict):
+            message_content = json.dumps(message_content, ensure_ascii=False)
+
+        if clarification_requested:
+            return ActionResult(
+                action="clarification",
+                message=message_content,
+                summary=validated.summary,
+            )
+
+        return ActionResult(
+            action="final",
+            message=message_content,
+            summary=validated.summary,
+        )
 
     def _extract_tool_calls(self, raw_response: Any) -> List[Dict[str, Any]]:
         if isinstance(raw_response, dict):
@@ -545,6 +871,8 @@ class Agent:
                     "id": call_id,
                     "name": name,
                     "arguments": arguments_dict,
+                    "correlation_id": call_id,
+                    "note": raw_call.get("note"),
                 }
             )
 
@@ -610,7 +938,13 @@ class Agent:
         except (TypeError, ValueError):
             return str(raw_response)
 
-    async def _finalize_response(self, thread: Thread, context: Optional[str]) -> None:
+    async def _finalize_response(
+        self,
+        thread: Thread,
+        context: Optional[str],
+        request_id: Optional[str] = None,
+        fallback_message: Optional[str] = None,
+    ) -> None:
         instruction = (
             "Summarize the conversation and answer the user's request. "
             "Respond as JSON with keys 'message' and optional 'summary'."
@@ -620,16 +954,33 @@ class Agent:
             instruction, thread, context, plan_index, mode="final"
         )
         try:
-            response = await self._llm_json_call(messages, FinalResponseModel, thread)
+            response = await self._llm_json_call(
+                messages,
+                FinalResponseModel,
+                thread,
+                request_id=request_id,
+            )
         except Exception as exc:
             logger.error("Final response generation failed", error=str(exc))
-            fallback = "I'm sorry, I couldn't generate a response right now."
+            fallback = (
+                fallback_message
+                or "I'm sorry, I couldn't generate a response right now."
+            )
+            if isinstance(fallback, dict):
+                fallback = json.dumps(fallback, ensure_ascii=False)
+            fallback_event = Event(
+                EventType.AGENT_RESPONSE,
+                fallback,
+                metadata=self._event_metadata(request_id),
+            )
             thread.add_message(Message("assistant", fallback))
-            thread.add_event(Event(EventType.AGENT_RESPONSE, fallback))
-            await self.callbacks.emit(Event(EventType.AGENT_RESPONSE, fallback))
+            thread.add_event(fallback_event)
+            await self.callbacks.emit(fallback_event)
             return
 
-        await self._commit_final_response(response.message, response.summary, thread)
+        await self._commit_final_response(
+            response.message, response.summary, thread, request_id=request_id
+        )
 
     async def _execute_tool(
         self,
@@ -638,30 +989,101 @@ class Agent:
         thread: Thread,
         *,
         call_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> None:
-        thread.add_event(
-            Event(EventType.TOOL_CALL, {"tool": intent, "arguments": arguments})
-        )
-        await self.callbacks.emit(
-            Event(EventType.TOOL_EXECUTION, {"tool": intent, "parameters": arguments})
-        )
-        logger.info(
-            "agent.tool.execute",
-            tool=intent,
-            arguments=json.dumps(arguments) if arguments else "{}",
-        )
+        correlation_id = call_id or f"tool_call_{uuid4().hex[:8]}"
+        with correlation_scope(correlation_id):
+            start_payload = {"tool": intent, "arguments": arguments}
+            tool_start_event = Event(
+                EventType.TOOL_EXECUTION_START,
+                start_payload,
+                metadata=self._event_metadata(request_id, correlation_id),
+            )
+            thread.add_event(tool_start_event)
+            await self.callbacks.emit(tool_start_event)
 
-        result: ToolResult = await self.tool_registry.execute_tool(intent, arguments)
+            tool_execution_event = Event(
+                EventType.TOOL_EXECUTION,
+                {"tool": intent, "parameters": arguments},
+                metadata=self._event_metadata(request_id, correlation_id),
+            )
+            thread.add_event(tool_execution_event)
+            await self.callbacks.emit(tool_execution_event)
 
-        payload = result.to_dict()
-        thread.add_event(Event(EventType.TOOL_RESULT, payload))
-        await self.callbacks.emit(Event(EventType.TOOL_RESULT, payload))
-        logger.info(
-            "agent.tool.result",
-            tool=intent,
-            success=result.success,
-        )
+            logger.info(
+                "agent.tool.execute",
+                tool=intent,
+                arguments=json.dumps(arguments) if arguments else "{}",
+            )
 
+            start_time = time.perf_counter()
+            duration_ms = None
+            try:
+                result: ToolResult = await self._await_with_timeout(
+                    self.tool_registry.execute_tool(intent, arguments),
+                    self.config.tool_timeout,
+                    f"Tool '{intent}' execution timed out",
+                )
+            except TimeoutError as exc:
+                duration_ms = int((time.perf_counter() - start_time) * 1000)
+                error_event = Event(
+                    EventType.TOOL_ERROR,
+                    {"tool": intent, "error": str(exc), "duration_ms": duration_ms},
+                    metadata=self._event_metadata(request_id, correlation_id),
+                )
+                thread.add_event(error_event)
+                await self.callbacks.emit(error_event)
+                result = ToolResult(
+                    success=False,
+                    error=str(exc),
+                )
+                self.metrics[f"tool_error_total"] += 1
+                self.metrics[f"tool_{intent}_error_total"] += 1
+            except Exception as exc:
+                duration_ms = int((time.perf_counter() - start_time) * 1000)
+                error_event = Event(
+                    EventType.TOOL_ERROR,
+                    {"tool": intent, "error": str(exc), "duration_ms": duration_ms},
+                    metadata=self._event_metadata(request_id, correlation_id),
+                )
+                thread.add_event(error_event)
+                await self.callbacks.emit(error_event)
+                result = ToolResult(success=False, error=str(exc))
+                self.metrics[f"tool_error_total"] += 1
+                self.metrics[f"tool_{intent}_error_total"] += 1
+            else:
+                duration_ms = int((time.perf_counter() - start_time) * 1000)
+
+            payload = result.to_dict()
+            payload.setdefault("metadata", {})["duration_ms"] = duration_ms
+            tool_result_event = Event(
+                EventType.TOOL_RESULT,
+                payload,
+                metadata=self._event_metadata(request_id, correlation_id),
+            )
+            thread.add_event(tool_result_event)
+            await self.callbacks.emit(tool_result_event)
+            logger.info(
+                "agent.tool.result",
+                tool=intent,
+                success=result.success,
+                duration_ms=duration_ms,
+            )
+
+            end_event = Event(
+                EventType.TOOL_EXECUTION_END,
+                {"tool": intent, "success": result.success, "duration_ms": duration_ms},
+                metadata=self._event_metadata(request_id, correlation_id),
+            )
+            thread.add_event(end_event)
+            await self.callbacks.emit(end_event)
+            self.metrics["tool_call_total"] += 1
+            self.metrics["tool_call_duration_ms_total"] += duration_ms or 0
+            self.metrics[f"tool_{intent}_call_total"] += 1
+            if result.success:
+                self.metrics["tool_success_total"] += 1
+            else:
+                self.metrics["tool_failure_total"] += 1
         summary = payload.get("llm") or payload.get("display") or payload.get("data")
         if isinstance(summary, (dict, list)):
             summary = json.dumps(summary)
@@ -669,6 +1091,7 @@ class Agent:
             Event(
                 EventType.AGENT_THINKING,
                 {"tool": intent, "result": summary},
+                metadata=self._event_metadata(request_id, correlation_id),
             )
         )
         logger.debug(
@@ -707,16 +1130,32 @@ class Agent:
             )
 
     async def _commit_final_response(
-        self, message: Union[str, Dict[str, Any]], summary: Optional[Any], thread: Thread
+        self,
+        message: Union[str, Dict[str, Any]],
+        summary: Optional[Any],
+        thread: Thread,
+        *,
+        request_id: Optional[str] = None,
     ) -> None:
-        final_message = message
-        if not isinstance(final_message, str):
-            final_message = json.dumps(final_message, ensure_ascii=False)
-
+        payload: Dict[str, Any] = {}
+        if isinstance(message, dict):
+            payload["message"] = message
+        else:
+            payload["message"] = message
+        if summary is not None:
+            payload["summary"] = summary
+        final_message = json.dumps(payload, ensure_ascii=False)
         thread.metadata.pop("pending_tool_calls", None)
-        thread.add_message(Message("assistant", final_message))
-        thread.add_event(Event(EventType.AGENT_RESPONSE, final_message))
-        await self.callbacks.emit(Event(EventType.AGENT_RESPONSE, final_message))
+        thread.add_message(
+            Message("assistant", final_message, metadata={"request_id": request_id} if request_id else {})
+        )
+        response_event = Event(
+            EventType.AGENT_RESPONSE,
+            final_message,
+            metadata=self._event_metadata(request_id),
+        )
+        thread.add_event(response_event)
+        await self.callbacks.emit(response_event)
         logger.info(
             "agent.final_response",
             message=final_message,
@@ -724,7 +1163,12 @@ class Agent:
             thread_id=thread.id,
         )
         if summary is not None:
-            thread.add_event(Event(EventType.INFO, {"summary": summary}))
+            info_event = Event(
+                EventType.INFO,
+                {"summary": summary},
+                metadata=self._event_metadata(request_id),
+            )
+            thread.add_event(info_event)
         self._complete_remaining_plan_steps(thread)
 
     def _build_messages(
@@ -779,12 +1223,13 @@ class Agent:
                 "\n\nDecision protocol:\n"
                 "- Decide whether to continue the reasoning with a tool call or respond directly.\n"
                 "- Call a tool when its output is required to answer confidently.\n"
-                "- When no tool is needed, reply to the user in natural language.\n"
+                "- When no tool is needed, reply by emitting STRICT JSON with keys 'message' and optional 'summary'.\n"
+                "- Include \"clarification\": true when you must ask the user for more information; place the question in 'message'.\n"
                 "- Always keep the user-facing response concise and helpful."
             )
         elif mode == "final":
             system_content += (
-                "\n\nCompose the final user-facing answer summarizing tool evidence."
+                "\n\nCompose the final user-facing answer summarizing tool evidence. Respond as JSON with keys 'message', optional 'summary', and include 'clarification': true if you still need more information."
             )
         elif mode == "clarification":
             system_content += (
@@ -903,9 +1348,18 @@ class Agent:
         # Default: skip plan for short, direct questions
         return False
 
-    async def _ensure_plan(self, thread: Thread, context: Optional[str]) -> None:
-        if not self.config.planning_enabled or thread.metadata.get("plan"):
+    async def _ensure_plan(
+        self, thread: Thread, context: Optional[str], request_id: Optional[str] = None
+    ) -> None:
+        if not self.config.planning_enabled:
             return
+
+        current_ts = thread.metadata.get("current_user_message_ts")
+        existing_plan_ts = thread.metadata.get("plan_message_ts")
+        if thread.metadata.get("plan") and existing_plan_ts == current_ts:
+            return
+
+        self._reset_plan_state(thread)
 
         last_user_message = thread.get_last_user_message() or ""
         if not self._should_generate_plan(thread, last_user_message, context):
@@ -916,85 +1370,127 @@ class Agent:
             )
             return
 
-        available_tools: List[str] = []
-        if hasattr(self.tool_registry, "tools") and isinstance(self.tool_registry.tools, dict):
-            available_tools = sorted(self.tool_registry.tools.keys())
+        plan_correlation_id = uuid4().hex[:8]
+        with correlation_scope(plan_correlation_id):
+            start_event = Event(
+                EventType.PLAN_GENERATING,
+                {"status": "starting", "thread_id": thread.id},
+                metadata=self._event_metadata(request_id, plan_correlation_id),
+            )
+            thread.add_event(start_event)
+            await self.callbacks.emit(start_event)
 
-        tool_text = ", ".join(available_tools) if available_tools else "registered tools"
+            available_tools: List[str] = []
+            if hasattr(self.tool_registry, "tools") and isinstance(self.tool_registry.tools, dict):
+                available_tools = sorted(self.tool_registry.tools.keys())
 
-        planning_messages: List[Dict[str, str]] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a planning assistant for another agent. "
-                    "Respond ONLY in JSON with the shape {\"steps\": [{\"description\": str, \"tool\": str|\"none\", \"success\": str}]}. "
-                    "Break the user's request into short, sequential steps. Mention the tool to use for each step where applicable from: "
-                    f"{tool_text}."
-                ),
-            }
-        ]
+            tool_text = ", ".join(available_tools) if available_tools else "registered tools"
 
-        planning_messages.append({"role": "user", "content": last_user_message})
-        if context:
-            planning_messages.append({"role": "system", "content": f"Additional context: {context}"})
+            planning_messages: List[Dict[str, str]] = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a planning assistant for another agent. "
+                        "Respond ONLY in JSON with the shape {\"steps\": [{\"description\": str, \"tool\": str|\"none\", \"success\": str}]}. "
+                        "Break the user's request into short, sequential steps. Mention the tool to use for each step where applicable from: "
+                        f"{tool_text}."
+                    ),
+                }
+            ]
 
-        logger.info(
-            "agent.plan.request",
-            thread_id=thread.id,
-            tools=available_tools,
-        )
+            planning_messages.append({"role": "user", "content": last_user_message})
+            if context:
+                planning_messages.append({"role": "system", "content": f"Additional context: {context}"})
 
-        try:
-            plan_response = await self._llm_json_call(planning_messages, PlanResponseModel, thread)
-            normalized_steps, parser_used = self._normalize_plan_steps(plan_response)
-        except Exception as exc:
-            logger.warning(
-                "agent.plan.failed",
-                error=str(exc),
+            logger.info(
+                "agent.plan.request",
                 thread_id=thread.id,
+                tools=available_tools,
             )
-            return
 
-        if not normalized_steps:
-            return
+            plan_start = time.perf_counter()
 
-        summary_lines = []
-        for step in normalized_steps:
-            tool_label = step["tool"]
-            if tool_label and tool_label.lower() not in {"none", ""}:
-                summary_lines.append(f"{step['position']}. {step['description']} (Tool: {tool_label})")
+            try:
+                plan_response = await self._llm_json_call(
+                    planning_messages, PlanResponseModel, thread, request_id=request_id, correlation_id=plan_correlation_id
+                )
+                normalized_steps, parser_used = self._normalize_plan_steps(plan_response)
+            except Exception as exc:
+                duration_ms = int((time.perf_counter() - plan_start) * 1000)
+                logger.warning(
+                    "agent.plan.failed",
+                    error=str(exc),
+                    thread_id=thread.id,
+                    duration_ms=duration_ms,
+                )
+                failure_event = Event(
+                    EventType.PLAN_GENERATING,
+                    {"status": "failed", "error": str(exc), "duration_ms": duration_ms},
+                    metadata=self._event_metadata(request_id, plan_correlation_id),
+                )
+                thread.add_event(failure_event)
+                await self.callbacks.emit(failure_event)
+                if self.config.planning_required:
+                    raise RuntimeError("Planning required but failed") from exc
+                return
+
+            duration_ms = int((time.perf_counter() - plan_start) * 1000)
+
+            if not normalized_steps:
+                if self.config.planning_required:
+                    raise RuntimeError("Planning required but produced no steps")
+                return
+
+            summary_lines = []
+            for step in normalized_steps:
+                tool_label = step["tool"]
+                if tool_label and tool_label.lower() not in {"none", ""}:
+                    summary_lines.append(f"{step['position']}. {step['description']} (Tool: {tool_label})")
+                else:
+                    summary_lines.append(f"{step['position']}. {step['description']}")
+            plan_summary = "\n".join(summary_lines)
+
+            thread.metadata["plan"] = plan_summary
+            thread.metadata["plan_steps"] = normalized_steps
+            thread.metadata["plan_index"] = 0
+            thread.metadata["plan_parser"] = parser_used
+            if isinstance(plan_response, PlanResponseModel):
+                thread.metadata["plan_raw"] = plan_response.model_dump(exclude_none=True)
             else:
-                summary_lines.append(f"{step['position']}. {step['description']}")
-        plan_summary = "\n".join(summary_lines)
+                thread.metadata["plan_raw"] = plan_response
+            thread.metadata["plan_message_ts"] = current_ts
 
-        thread.metadata["plan"] = plan_summary
-        thread.metadata["plan_steps"] = normalized_steps
-        thread.metadata["plan_index"] = 0
-        thread.metadata["plan_parser"] = parser_used
-        if isinstance(plan_response, PlanResponseModel):
-            thread.metadata["plan_raw"] = plan_response.model_dump(exclude_none=True)
-        else:
-            thread.metadata["plan_raw"] = plan_response
-
-        thread.add_message(
-            Message(
-                "assistant",
-                f"[Plan]\n{plan_summary}",
-                metadata={"internal": True, "type": "plan", "exclude_from_prompt": True},
+            thread.add_message(
+                Message(
+                    "assistant",
+                    f"[Plan]\n{plan_summary}",
+                    metadata={"internal": True, "type": "plan", "exclude_from_prompt": True},
+                )
             )
-        )
-        thread.add_event(
-            Event(
-                EventType.AGENT_THINKING,
-                {"plan": plan_summary, "steps": normalized_steps},
+            for step in normalized_steps:
+                plan_step_event = Event(
+                    EventType.PLAN_STEP,
+                    {"step": step, "plan": plan_summary},
+                    metadata=self._event_metadata(request_id, plan_correlation_id),
+                )
+                thread.add_event(plan_step_event)
+                await self.callbacks.emit(plan_step_event)
+            plan_ready_event = Event(
+                EventType.PLAN_GENERATING,
+                {"status": "completed", "steps": len(normalized_steps), "duration_ms": duration_ms},
+                metadata=self._event_metadata(request_id, plan_correlation_id),
             )
-        )
-        logger.info(
-            "agent.plan.created",
-            thread_id=thread.id,
-            steps=len(normalized_steps),
-            parser=parser_used,
-        )
+            thread.add_event(plan_ready_event)
+            await self.callbacks.emit(plan_ready_event)
+            logger.info(
+                "agent.plan.created",
+                thread_id=thread.id,
+                steps=len(normalized_steps),
+                parser=parser_used,
+                duration_ms=duration_ms,
+            )
+            self.metrics["plan_generated_total"] += 1
+            self.metrics["plan_generation_duration_ms_total"] += duration_ms
 
     def _normalize_plan_steps(
         self, plan_data: PlanResponseModel | str
@@ -1066,7 +1562,14 @@ class Agent:
         }
         if reason:
             progress_payload["reason"] = reason
-        thread.add_event(Event(EventType.AGENT_THINKING, progress_payload))
+        request_id = thread.metadata.get("last_request_id")
+        thread.add_event(
+            Event(
+                EventType.AGENT_THINKING,
+                progress_payload,
+                metadata=self._event_metadata(request_id),
+            )
+        )
         logger.info(
             "agent.plan.progress",
             thread_id=thread.id,
@@ -1083,7 +1586,11 @@ class Agent:
             return
         thread.metadata["plan_index"] = len(plan_steps)
         thread.add_event(
-            Event(EventType.AGENT_THINKING, {"plan_complete": True, "total_steps": len(plan_steps)})
+            Event(
+                EventType.AGENT_THINKING,
+                {"plan_complete": True, "total_steps": len(plan_steps)},
+                metadata=self._event_metadata(thread.metadata.get("last_request_id")),
+            )
         )
         logger.info("agent.plan.completed", thread_id=thread.id, total=len(plan_steps))
 
@@ -1100,6 +1607,11 @@ class Agent:
     def _apply_env_defaults(self) -> None:
         """Populate API key/model from environment if not provided."""
         provider = self.config.provider.lower()
+        fields_set = getattr(
+            self.config,
+            "model_fields_set",
+            getattr(self.config, "__fields_set__", set()),
+        )
 
         api_key_sources = [
             f"{provider.upper()}_API_KEY",  # e.g. OPENAI_API_KEY
@@ -1117,12 +1629,13 @@ class Agent:
             "MINIAGENT_MODEL",
             f"{provider.upper()}_MODEL",
         ]
-        for var in model_sources:
-            value = os.getenv(var)
-            if value:
-                self.config.model = value
-                logger.info("agent.config.model_loaded", source=var, model=value)
-                break
+        if "model" not in fields_set:
+            for var in model_sources:
+                value = os.getenv(var)
+                if value:
+                    self.config.model = value
+                    logger.info("agent.config.model_loaded", source=var, model=value)
+                    break
 
 
 
