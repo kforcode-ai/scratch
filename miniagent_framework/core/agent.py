@@ -9,38 +9,18 @@ import time
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Dict, List, Optional, Literal, Type, Union, Tuple, Awaitable
+from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional, Literal, Type, Union, Tuple, Awaitable
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
-from structlog.contextvars import bind_contextvars, clear_contextvars, get_contextvars, unbind_contextvars
+from structlog.contextvars import clear_contextvars
 
 from .core import Message, Thread
 from .events import Event, EventType, StreamCallback
 from .llm import LLMClient, RetryPolicy
 from .logging import logger
+from .observability import Observability, OperationContext
 from .tools import ToolRegistry, ToolResult
-
-
-@contextmanager
-def correlation_scope(correlation_id: Optional[str]):
-    """Context manager to bind/unbind correlation id for structured logging."""
-    if not correlation_id:
-        yield
-        return
-    context = get_contextvars()
-    previous = context.get("correlation_id")
-    bind_contextvars(correlation_id=correlation_id)
-    try:
-        yield
-    finally:
-        if previous is None:
-            try:
-                unbind_contextvars("correlation_id")
-            except LookupError:
-                pass
-        else:
-            bind_contextvars(correlation_id=previous)
 
 
 class AgentConfig(BaseModel):
@@ -133,6 +113,7 @@ class Agent:
             retry_policy=self.config.retry_policy,
         )
         self.callbacks = callbacks or StreamCallback()
+        self.observability = Observability(self.callbacks)
         self.offline = self.llm.client is None
         if self.offline:
             logger.warning(
@@ -141,6 +122,13 @@ class Agent:
         self.metrics: Counter[str] = Counter()
         if os.getenv("MINIAGENT_EVENT_LOG", "0") == "1":
             self.callbacks.on_any(self._log_event_telemetry)
+
+    @staticmethod
+    def _elapsed_ms(start: float, *, end: Optional[float] = None) -> int:
+        """Convert perf_counter delta to milliseconds with a 1ms floor."""
+        stop = end if end is not None else time.perf_counter()
+        duration = max(0.0, stop - start)
+        return max(1, int(duration * 1000))
 
     def metrics_snapshot(self) -> Dict[str, int]:
         """Return a shallow copy of collected metrics for external reporting."""
@@ -158,15 +146,77 @@ class Agent:
             content=content,
         )
 
-    def _event_metadata(
-        self, request_id: Optional[str] = None, correlation_id: Optional[str] = None
+    @contextmanager
+    def _operation_scope(
+        self,
+        name: str,
+        *,
+        operation_id: Optional[str] = None,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[OperationContext]:
+        with self.observability.operation_scope(
+            name,
+            operation_id=operation_id,
+            attributes=attributes,
+        ) as op_context:
+            yield op_context
+
+    def _augment_llm_metrics(
+        self,
+        base: Dict[str, Any],
+        metrics: Optional[Dict[str, Any]],
+        *,
+        default_model: Optional[str] = None,
+        ttft_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
-        metadata: Dict[str, Any] = {}
-        if request_id:
-            metadata["request_id"] = request_id
-        if correlation_id:
-            metadata["correlation_id"] = correlation_id
-        return metadata
+        return self.observability.augment_llm_metrics(
+            base,
+            metrics,
+            default_model=default_model,
+            ttft_ms=ttft_ms,
+        )
+
+    def _schedule_web_search_fallback(
+        self,
+        thread: Thread,
+        topic: Optional[str],
+        *,
+        request_id: Optional[str] = None,
+    ) -> bool:
+        registry = getattr(self.tool_registry, "tools", {}) or {}
+        if "web_search" not in registry:
+            return False
+        pending = thread.metadata.get("pending_tool_calls", []) or []
+        for call in pending:
+            if call.get("name") == "web_search":
+                return False
+        fallback_markers: List[str] = thread.metadata.setdefault("fallback_scheduled", [])
+        marker = f"{thread.metadata.get('current_user_message_ts','')}|web_search"
+        if marker in fallback_markers:
+            return False
+        query = (topic or "").strip()
+        if not query:
+            last_user = next((m.content for m in reversed(thread.messages) if m.role == "user"), "")
+            query = last_user.strip()
+        if not query:
+            return False
+        fallback_call = {
+            "id": uuid4().hex[:8],
+            "name": "web_search",
+            "arguments": {"query": query},
+            "note": "Fallback search after empty knowledge_base result",
+        }
+        self._queue_tool_calls(thread, [fallback_call])
+        fallback_markers.append(marker)
+        logger.info(
+            "agent.tool.fallback_scheduled",
+            thread_id=thread.id,
+            from_tool="knowledge_base",
+            fallback_tool="web_search",
+            query=query,
+            request_id=request_id,
+        )
+        return True
 
     def _prepare_new_turn(
         self, thread: Thread, message: Message, *, request_id: Optional[str] = None
@@ -178,10 +228,12 @@ class Agent:
         thread.metadata["last_request_id"] = request_id
         if not thread.metadata.get("plan") or last_planned_ts != current_ts:
             self._reset_plan_state(thread)
+        thread.metadata.pop("final_response_message", None)
+        thread.metadata.pop("final_response_summary", None)
 
     def _reset_plan_state(self, thread: Thread) -> None:
         """Clear plan metadata so a fresh plan can be generated."""
-        for key in ("plan", "plan_steps", "plan_index", "plan_parser", "plan_raw"):
+        for key in ("plan", "plan_steps", "plan_index", "plan_parser", "plan_raw", "plan_skips", "fallback_scheduled"):
             thread.metadata.pop(key, None)
         thread.metadata["plan_message_ts"] = None
 
@@ -210,81 +262,102 @@ class Agent:
         if stream is None:
             stream = self.config.stream_by_default
         request_id = uuid4().hex[:8]
+        session_id = thread.id
+        trace_id = thread.metadata.get("trace_id")
+        if not trace_id:
+            trace_id = uuid4().hex
+            thread.metadata["trace_id"] = trace_id
+        base_logger = logger.bind(
+            request_id=request_id,
+            thread_id=thread.id,
+            session_id=session_id,
+            trace_id=trace_id,
+        )
         try:
-            bind_contextvars(request_id=request_id, thread_id=thread.id)
-            run_logger = logger.bind(request_id=request_id, thread_id=thread.id)
-            run_logger.info(
-                "agent.run.start",
-                user_input=user_input,
-                stream=stream,
-            )
-            message = Message("user", user_input, metadata={"request_id": request_id})
-            thread.add_message(message)
-            self._prepare_new_turn(thread, message, request_id=request_id)
-            start_event = Event(
-                EventType.AGENT_START,
-                {"thread_id": thread.id, "user_input": user_input},
-                metadata={"request_id": request_id},
-            )
-            thread.add_event(start_event)
-            await self.callbacks.emit(start_event)
-
-            async for _ in self.agent_loop(
-                thread,
-                context=context,
-                stream=stream,
-                max_iterations=max_iterations,
+            with self.observability.session_scope(
+                session_id=session_id,
                 request_id=request_id,
+                trace_id=trace_id,
+                thread_id=thread.id,
             ):
-                pass
+                with self._operation_scope("agent.run", operation_id=request_id) as run_op:
+                    scoped_logger = base_logger.bind(operation_id=run_op.operation_id)
+                    scoped_logger.info(
+                        "agent.run.start",
+                        user_input=user_input,
+                        stream=stream,
+                    )
+                    message = Message("user", user_input, metadata={"request_id": request_id})
+                    thread.add_message(message)
+                    self._prepare_new_turn(thread, message, request_id=request_id)
+                    await self.observability.emit(
+                        EventType.AGENT_START,
+                        {"thread_id": thread.id, "user_input": user_input},
+                        thread=thread,
+                        request_id=request_id,
+                    )
+
+                    async for _ in self.agent_loop(
+                        thread,
+                        context=context,
+                        stream=stream,
+                        max_iterations=max_iterations,
+                        request_id=request_id,
+                    ):
+                        pass
+
+                    final_message = thread.metadata.get("final_response_message")
+                    if isinstance(final_message, str):
+                        return final_message
+
+                    for event in reversed(thread.events):
+                        if event.type == EventType.AGENT_RESPONSE and isinstance(event.data, str):
+                            thread.metadata["final_response_message"] = event.data
+                            return event.data
+
+                    fallback = "I'm sorry, I couldn't produce an answer this time."
+                    thread.metadata["final_response_message"] = fallback
+                    thread.metadata.pop("final_response_summary", None)
+                    await self.observability.emit(
+                        EventType.AGENT_RESPONSE,
+                        fallback,
+                        thread=thread,
+                        request_id=request_id,
+                    )
+                    logger.warning(
+                        "agent.final_response_missing",
+                        thread_id=thread.id,
+                        event_count=len(thread.events),
+                    )
+                    return fallback
         except Exception as exc:
-            run_logger = logger.bind(request_id=request_id, thread_id=thread.id)
-            run_logger.error(
+            base_logger.error(
                 "agent.run.exception",
                 error=str(exc),
                 exc_type=type(exc).__name__,
             )
             logger.exception("agent.run.exception_trace")
-            error_event = Event(
+            await self.observability.emit(
                 EventType.ERROR,
                 {"error": str(exc)},
-                metadata={"request_id": request_id},
+                thread=thread,
+                request_id=request_id,
             )
-            thread.add_event(error_event)
-            await self.callbacks.emit(error_event)
             if isinstance(exc, RuntimeError):
                 fallback = f"Configuration issue: {exc}"
             else:
                 fallback = "I'm sorry, I ran into an internal error while responding."
-            response_event = Event(
+            thread.metadata["final_response_message"] = fallback
+            thread.metadata.pop("final_response_summary", None)
+            await self.observability.emit(
                 EventType.AGENT_RESPONSE,
                 fallback,
-                metadata={"request_id": request_id},
+                thread=thread,
+                request_id=request_id,
             )
-            thread.add_event(response_event)
-            await self.callbacks.emit(response_event)
             return fallback
         finally:
             clear_contextvars()
-
-        for event in reversed(thread.events):
-            if event.type == EventType.AGENT_RESPONSE and isinstance(event.data, str):
-                return event.data
-
-        fallback = "I'm sorry, I couldn't produce an answer this time."
-        response_event = Event(
-            EventType.AGENT_RESPONSE,
-            fallback,
-            metadata={"request_id": request_id},
-        )
-        thread.add_event(response_event)
-        await self.callbacks.emit(response_event)
-        logger.warning(
-            "agent.final_response_missing",
-            thread_id=thread.id,
-            event_count=len(thread.events),
-        )
-        return fallback
 
     async def agent_loop(
         self,
@@ -318,12 +391,11 @@ class Agent:
 
             if action.action == "tool" and action.tool:
                 if action.message:
-                    thread.add_event(
-                        Event(
-                            EventType.AGENT_THINKING,
-                            {"tool": action.tool, "note": action.message},
-                            metadata={"request_id": request_id},
-                        )
+                    await self.observability.emit(
+                        EventType.AGENT_THINKING,
+                        {"tool": action.tool, "note": action.message},
+                        thread=thread,
+                        request_id=request_id,
                     )
                 await self._execute_tool(
                     action.tool,
@@ -338,13 +410,13 @@ class Agent:
             if action.action == "clarification" and action.message:
                 clarification_msg = action.message
                 thread.add_message(Message("assistant", clarification_msg))
-                clarification_event = Event(
+                await self.observability.emit(
                     EventType.AGENT_RESPONSE,
                     clarification_msg,
-                    metadata={"request_id": request_id, "intent": "clarification"},
+                    thread=thread,
+                    request_id=request_id,
+                    extra_metadata={"intent": "clarification"},
                 )
-                thread.add_event(clarification_event)
-                await self.callbacks.emit(clarification_event)
                 logger.info(
                     "agent.clarification_requested",
                     message=clarification_msg,
@@ -393,18 +465,18 @@ class Agent:
         response_model: Type[BaseModel],
         thread: Optional[Thread] = None,
         request_id: Optional[str] = None,
-        correlation_id: Optional[str] = None,
+        operation_id: Optional[str] = None,
     ) -> BaseModel:
-        correlation = correlation_id or uuid4().hex[:8]
-        with correlation_scope(correlation):
-            llm_start = Event(
+        start_wall_ms = time.time_ns() // 1_000_000
+        with self._operation_scope("llm.json", operation_id=operation_id) as llm_op:
+            current_operation = llm_op.operation_id
+            await self.observability.emit(
                 EventType.LLM_CALL_START,
                 {"messages": len(messages)},
-                metadata=self._event_metadata(request_id, correlation),
+                thread=thread,
+                request_id=request_id,
+                operation_id=current_operation,
             )
-            if thread:
-                thread.add_event(llm_start)
-            await self.callbacks.emit(llm_start)
 
             logger.debug(
                 "agent.llm.request",
@@ -430,15 +502,19 @@ class Agent:
                     "LLM request timed out",
                 )
             except Exception as exc:
-                duration_ms = int((time.perf_counter() - start_time) * 1000)
-                error_event = Event(
+                duration_ms = self._elapsed_ms(start_time)
+                await self.observability.emit(
                     EventType.LLM_ERROR,
-                    {"error": str(exc), "duration_ms": duration_ms},
-                    metadata=self._event_metadata(request_id, correlation),
+                    {
+                        "error": str(exc),
+                        "latency_ms": duration_ms,
+                        "start_ms": start_wall_ms,
+                        "end_ms": start_wall_ms + duration_ms,
+                    },
+                    thread=thread,
+                    request_id=request_id,
+                    operation_id=current_operation,
                 )
-                if thread:
-                    thread.add_event(error_event)
-                await self.callbacks.emit(error_event)
                 self.metrics["llm_error_total"] += 1
                 raise
 
@@ -470,20 +546,30 @@ class Agent:
                 logger.error("Response validation failed", error=str(exc), payload=data)
                 raise
 
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
-            llm_end = Event(
-                EventType.LLM_CALL_END,
-                {"model": response_model.__name__, "duration_ms": duration_ms},
-                metadata=self._event_metadata(request_id, correlation),
+            duration_ms = self._elapsed_ms(start_time)
+            metrics_payload = self.llm.consume_last_metrics()
+            llm_data: Dict[str, Any] = {
+                "latency_ms": duration_ms,
+                "start_ms": start_wall_ms,
+                "end_ms": start_wall_ms + duration_ms,
+            }
+            llm_data = self._augment_llm_metrics(
+                llm_data,
+                metrics_payload,
+                default_model=self.config.model or response_model.__name__,
             )
-            if thread:
-                thread.add_event(llm_end)
-            await self.callbacks.emit(llm_end)
+            await self.observability.emit(
+                EventType.LLM_CALL_END,
+                llm_data,
+                thread=thread,
+                request_id=request_id,
+                operation_id=current_operation,
+            )
 
             logger.debug(
                 "agent.llm.validated_response",
-                model=response_model.__name__,
-                duration_ms=duration_ms,
+                model=llm_data.get("model", response_model.__name__),
+                latency_ms=duration_ms,
                 thread_id=thread.id if thread else None,
             )
             self.metrics["llm_call_total"] += 1
@@ -507,17 +593,17 @@ class Agent:
                 thread_id=thread.id,
                 source="pending_queue",
             )
-            tool_selection_event = Event(
+            await self.observability.emit(
                 EventType.TOOL_SELECTION,
                 {
                     "tool": pending_call["name"],
                     "arguments": pending_call["arguments"],
                     "source": "pending_queue",
                 },
-                metadata=self._event_metadata(request_id, pending_call.get("id")),
+                thread=thread,
+                request_id=request_id,
+                operation_id=pending_call.get("id"),
             )
-            thread.add_event(tool_selection_event)
-            await self.callbacks.emit(tool_selection_event)
             return ActionResult(
                 action="tool",
                 tool=pending_call["name"],
@@ -536,17 +622,18 @@ class Agent:
         messages = self._build_messages(
             instruction, thread, context, iteration, mode="decision"
         )
-        decision_correlation = uuid4().hex[:8]
         tool_calls_payload: Optional[List[Dict[str, Any]]] = None
         final_text: Optional[str] = None
-        with correlation_scope(decision_correlation):
-            llm_start = Event(
+        stream_metrics: Dict[str, Any] = {}
+        with self._operation_scope("llm.decision") as decision_op:
+            decision_operation_id = decision_op.operation_id
+            await self.observability.emit(
                 EventType.LLM_CALL_START,
                 {"messages": len(messages), "phase": "decision"},
-                metadata=self._event_metadata(request_id, decision_correlation),
+                thread=thread,
+                request_id=request_id,
+                operation_id=decision_operation_id,
             )
-            thread.add_event(llm_start)
-            await self.callbacks.emit(llm_start)
             logger.debug(
                 "agent.decision.request",
                 thread_id=thread.id,
@@ -558,15 +645,16 @@ class Agent:
             )
 
             decision_start = time.perf_counter()
+            decision_start_wall_ms = time.time_ns() // 1_000_000
             duration_ms = None
             try:
                 if stream:
-                    tool_calls_payload, final_text = await self._stream_decision_response(
+                    tool_calls_payload, final_text, stream_metrics = await self._stream_decision_response(
                         messages,
                         tool_schemas,
                         thread,
                         request_id=request_id,
-                        correlation_id=decision_correlation,
+                        operation_id=decision_operation_id,
                     )
                 else:
                     raw_response = await self._await_with_timeout(
@@ -588,102 +676,138 @@ class Agent:
                     tool_calls_payload = self._extract_tool_calls(raw_response)
                     final_text = self._extract_text_response(raw_response)
             except Exception as exc:
-                duration_ms = int((time.perf_counter() - decision_start) * 1000)
-                error_event = Event(
+                duration_ms = self._elapsed_ms(decision_start)
+                await self.observability.emit(
                     EventType.LLM_ERROR,
-                    {"error": str(exc), "phase": "decision", "duration_ms": duration_ms},
-                    metadata=self._event_metadata(request_id, decision_correlation),
+                    {
+                        "error": str(exc),
+                        "phase": "decision",
+                        "latency_ms": duration_ms,
+                        "start_ms": decision_start_wall_ms,
+                        "end_ms": decision_start_wall_ms + duration_ms,
+                    },
+                    thread=thread,
+                    request_id=request_id,
+                    operation_id=decision_operation_id,
                 )
-                thread.add_event(error_event)
-                await self.callbacks.emit(error_event)
                 self.metrics["llm_error_total"] += 1
                 raise
             finally:
                 if duration_ms is None:
-                    duration_ms = int((time.perf_counter() - decision_start) * 1000)
-                llm_end = Event(
-                    EventType.LLM_CALL_END,
-                    {"phase": "decision", "duration_ms": duration_ms},
-                    metadata=self._event_metadata(request_id, decision_correlation),
+                    if stream and stream_metrics.get("latency_ms"):
+                        duration_ms = stream_metrics["latency_ms"]
+                    else:
+                        duration_ms = self._elapsed_ms(decision_start)
+                metrics_payload = self.llm.consume_last_metrics()
+                base_metrics: Dict[str, Any] = {
+                    "phase": "decision",
+                    "latency_ms": duration_ms,
+                }
+                ttft_override: Optional[int] = None
+                if stream:
+                    stream_payload = dict(stream_metrics)
+                    ttft_override = stream_payload.pop("ttft_ms", None)
+                    base_metrics.update(stream_payload)
+                else:
+                    base_metrics.update(
+                        {
+                            "start_ms": decision_start_wall_ms,
+                            "end_ms": decision_start_wall_ms + duration_ms,
+                        }
+                    )
+                llm_data = self._augment_llm_metrics(
+                    base_metrics,
+                    metrics_payload,
+                    default_model=self.config.model,
+                    ttft_ms=ttft_override,
                 )
-                thread.add_event(llm_end)
-                await self.callbacks.emit(llm_end)
+                if "start_ms" not in llm_data:
+                    llm_data["start_ms"] = decision_start_wall_ms
+                if "end_ms" not in llm_data:
+                    llm_data["end_ms"] = decision_start_wall_ms + duration_ms
+                await self.observability.emit(
+                    EventType.LLM_CALL_END,
+                    llm_data,
+                    thread=thread,
+                    request_id=request_id,
+                    operation_id=decision_operation_id,
+                )
                 self.metrics["llm_call_total"] += 1
                 self.metrics["llm_call_duration_ms_total"] += duration_ms
 
-        if tool_calls_payload:
-            formatted_calls, pending_calls = self._prepare_tool_calls(tool_calls_payload)
-            if pending_calls:
-                assistant_message = Message(
-                    "assistant",
-                    content="",
-                    metadata={
-                        "internal": True,
-                        "type": "tool_call",
-                        "include_in_prompt": True,
-                        "tools": [call["name"] for call in pending_calls],
-                    },
-                    tool_calls=formatted_calls,
-                )
-                thread.add_message(assistant_message)
-                self._queue_tool_calls(thread, pending_calls)
-                next_call = self._pop_next_tool_call(thread)
-                if next_call:
-                    logger.info(
-                        "agent.intent.selected",
-                        action="tool",
-                        tool=next_call["name"],
-                        thread_id=thread.id,
-                    )
-                    selection_event = Event(
-                        EventType.TOOL_SELECTION,
-                        {
-                            "tool": next_call["name"],
-                            "arguments": next_call["arguments"],
-                            "tool_call_id": next_call["id"],
+            if tool_calls_payload:
+                formatted_calls, pending_calls = self._prepare_tool_calls(tool_calls_payload)
+                if pending_calls:
+                    assistant_message = Message(
+                        "assistant",
+                        content="",
+                        metadata={
+                            "internal": True,
+                            "type": "tool_call",
+                            "include_in_prompt": True,
+                            "tools": [call["name"] for call in pending_calls],
                         },
-                        metadata=self._event_metadata(request_id, next_call.get("id")),
+                        tool_calls=formatted_calls,
                     )
-                    thread.add_event(selection_event)
-                    await self.callbacks.emit(selection_event)
-                    return ActionResult(
-                        action="tool",
-                        tool=next_call["name"],
-                        arguments=next_call["arguments"],
-                        tool_call_id=next_call["id"],
-                    )
-            logger.warning(
-                "agent.tool_call.parsing_failed",
-                thread_id=thread.id,
-                payload=tool_calls_payload,
-            )
+                    thread.add_message(assistant_message)
+                    self._queue_tool_calls(thread, pending_calls)
+                    next_call = self._pop_next_tool_call(thread)
+                    if next_call:
+                        logger.info(
+                            "agent.intent.selected",
+                            action="tool",
+                            tool=next_call["name"],
+                            thread_id=thread.id,
+                        )
+                        await self.observability.emit(
+                            EventType.TOOL_SELECTION,
+                            {
+                                "tool": next_call["name"],
+                                "arguments": next_call["arguments"],
+                                "tool_call_id": next_call["id"],
+                            },
+                            thread=thread,
+                            request_id=request_id,
+                            operation_id=next_call.get("id"),
+                        )
+                        return ActionResult(
+                            action="tool",
+                            tool=next_call["name"],
+                            arguments=next_call["arguments"],
+                            tool_call_id=next_call["id"],
+                        )
+                logger.warning(
+                    "agent.tool_call.parsing_failed",
+                    thread_id=thread.id,
+                    payload=tool_calls_payload,
+                )
 
-        action_result = self._parse_final_action(final_text)
-        if action_result.action == "fallback":
-            logger.warning(
-                "agent.decision.unstructured_response",
+            action_result = self._parse_final_action(final_text)
+            if action_result.action == "fallback":
+                logger.warning(
+                    "agent.decision.unstructured_response",
+                    thread_id=thread.id,
+                    iteration=iteration,
+                )
+            else:
+                await self.observability.emit(
+                    EventType.LLM_RESPONSE,
+                    {
+                        "action": action_result.action,
+                        "message": action_result.message,
+                        "summary": action_result.summary,
+                    },
+                    thread=thread,
+                    request_id=request_id,
+                    operation_id=decision_operation_id,
+                )
+            logger.info(
+                "agent.intent.selected",
+                action=action_result.action,
+                tool=None,
                 thread_id=thread.id,
-                iteration=iteration,
             )
-        else:
-            response_event = Event(
-                EventType.LLM_RESPONSE,
-                {
-                    "action": action_result.action,
-                    "message": action_result.message,
-                    "summary": action_result.summary,
-                },
-                metadata=self._event_metadata(request_id, decision_correlation),
-            )
-            thread.add_event(response_event)
-            await self.callbacks.emit(response_event)
-        logger.info(
-            "agent.intent.selected",
-            action=action_result.action,
-            tool=None,
-            thread_id=thread.id,
-        )
-        return action_result
+            return action_result
 
     async def _stream_decision_response(
         self,
@@ -691,72 +815,86 @@ class Agent:
         tool_schemas: Optional[List[Dict[str, Any]]],
         thread: Thread,
         request_id: Optional[str] = None,
-        correlation_id: Optional[str] = None,
-    ) -> Tuple[List[Dict[str, Any]], str]:
-        stream_iter = await self._await_with_timeout(
-            self.llm.complete(
-                messages=messages,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-                stream=True,
-                tools=tool_schemas,
-            ),
-            self.config.llm_timeout,
-            "LLM streaming request timed out",
-        )
+        operation_id: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
+        with self._operation_scope("llm.stream", operation_id=operation_id) as stream_op:
+            stream_operation = stream_op.operation_id
+            start_time = time.perf_counter()
+            start_wall_ms = time.time_ns() // 1_000_000
+            ttft_ms: Optional[int] = None
+            stream_iter = await self._await_with_timeout(
+                self.llm.complete(
+                    messages=messages,
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens,
+                    stream=True,
+                    tools=tool_schemas,
+                ),
+                self.config.llm_timeout,
+                "LLM streaming request timed out",
+            )
 
-        chunks: List[str] = []
-        tool_calls: List[Dict[str, Any]] = []
-        stream_started = False
+            chunks: List[str] = []
+            tool_calls: List[Dict[str, Any]] = []
+            stream_started = False
 
-        async for chunk in stream_iter:
-            if isinstance(chunk, str):
-                if not stream_started:
-                    stream_started = True
-                    await self.callbacks.emit(
-                        Event(
+            async for chunk in stream_iter:
+                if isinstance(chunk, str):
+                    if not stream_started:
+                        stream_started = True
+                        ttft_ms = self._elapsed_ms(start_time)
+                        await self.observability.emit(
                             EventType.STREAM_START,
                             None,
-                            metadata=self._event_metadata(request_id, correlation_id),
+                            request_id=request_id,
+                            operation_id=stream_operation,
                         )
-                    )
-                chunks.append(chunk)
-                await self.callbacks.emit(
-                    Event(
+                    chunks.append(chunk)
+                    await self.observability.emit(
                         EventType.STREAM_CHUNK,
                         chunk,
-                        metadata=self._event_metadata(request_id, correlation_id),
+                        request_id=request_id,
+                        operation_id=stream_operation,
                     )
+                elif isinstance(chunk, dict):
+                    extracted = self._extract_tool_calls(chunk)
+                    if extracted:
+                        tool_calls.extend(extracted)
+                else:
+                    logger.debug(
+                        "agent.decision.stream.unknown_chunk",
+                        chunk_type=type(chunk).__name__,
+                        thread_id=thread.id,
+                    )
+
+            if stream_started:
+                await self.observability.emit(
+                    EventType.STREAM_END,
+                    None,
+                    request_id=request_id,
+                    operation_id=stream_operation,
                 )
-            elif isinstance(chunk, dict):
-                extracted = self._extract_tool_calls(chunk)
-                if extracted:
-                    tool_calls.extend(extracted)
-            else:
+
+            final_text = "".join(chunks)
+            if stream_started and ttft_ms is None:
+                ttft_ms = self._elapsed_ms(start_time)
+            if final_text:
                 logger.debug(
-                    "agent.decision.stream.unknown_chunk",
-                    chunk_type=type(chunk).__name__,
+                    "agent.decision.stream.final_text_preview",
+                    preview=final_text[:200],
                     thread_id=thread.id,
                 )
 
-        if stream_started:
-            await self.callbacks.emit(
-                Event(
-                    EventType.STREAM_END,
-                    None,
-                    metadata=self._event_metadata(request_id, correlation_id),
-                )
-            )
+            latency_ms = self._elapsed_ms(start_time)
+            metrics: Dict[str, Any] = {
+                "latency_ms": latency_ms,
+                "start_ms": start_wall_ms,
+                "end_ms": start_wall_ms + latency_ms,
+            }
+            if ttft_ms is not None:
+                metrics["ttft_ms"] = ttft_ms
 
-        final_text = "".join(chunks)
-        if final_text:
-            logger.debug(
-                "agent.decision.stream.final_text_preview",
-                preview=final_text[:200],
-                thread_id=thread.id,
-            )
-
-        return tool_calls, final_text
+            return tool_calls, final_text, metrics
 
     def _parse_final_action(self, final_text: Any) -> ActionResult:
         if final_text is None:
@@ -871,7 +1009,7 @@ class Agent:
                     "id": call_id,
                     "name": name,
                     "arguments": arguments_dict,
-                    "correlation_id": call_id,
+                    "operation_id": call_id,
                     "note": raw_call.get("note"),
                 }
             )
@@ -949,6 +1087,46 @@ class Agent:
             "Summarize the conversation and answer the user's request. "
             "Respond as JSON with keys 'message' and optional 'summary'."
         )
+        pending_calls: List[Dict[str, Any]] = thread.metadata.pop("pending_tool_calls", []) or []
+        if pending_calls:
+            logger.warning(
+                "agent.pending_tool_calls.flushed",
+                thread_id=thread.id,
+                pending=len(pending_calls),
+            )
+            for call in pending_calls:
+                tool_name = call.get("name") or "unknown"
+                call_id = call.get("id")
+                failure_note = {
+                    "error": "tool_call_incomplete",
+                    "message": "Tool call skipped because the agent finalized the response before completion.",
+                }
+                thread.add_message(
+                    Message(
+                        "tool",
+                        json.dumps(failure_note, ensure_ascii=False),
+                        metadata={
+                            "internal": True,
+                            "type": "tool_result",
+                            "tool": tool_name,
+                            "success": False,
+                        },
+                        tool_call_id=call_id,
+                        name=tool_name,
+                    )
+                )
+                await self.observability.emit(
+                    EventType.TOOL_ERROR,
+                    {
+                        "tool": tool_name,
+                        "error": failure_note["error"],
+                        "reason": failure_note["message"],
+                    },
+                    thread=thread,
+                    request_id=request_id,
+                    operation_id=call.get("operation_id"),
+                )
+
         plan_index = thread.metadata.get("plan_index", 0)
         messages = self._build_messages(
             instruction, thread, context, plan_index, mode="final"
@@ -968,14 +1146,15 @@ class Agent:
             )
             if isinstance(fallback, dict):
                 fallback = json.dumps(fallback, ensure_ascii=False)
-            fallback_event = Event(
+            thread.add_message(Message("assistant", fallback))
+            thread.metadata["final_response_message"] = fallback
+            thread.metadata.pop("final_response_summary", None)
+            await self.observability.emit(
                 EventType.AGENT_RESPONSE,
                 fallback,
-                metadata=self._event_metadata(request_id),
+                thread=thread,
+                request_id=request_id,
             )
-            thread.add_message(Message("assistant", fallback))
-            thread.add_event(fallback_event)
-            await self.callbacks.emit(fallback_event)
             return
 
         await self._commit_final_response(
@@ -991,29 +1170,31 @@ class Agent:
         call_id: Optional[str] = None,
         request_id: Optional[str] = None,
     ) -> None:
-        correlation_id = call_id or f"tool_call_{uuid4().hex[:8]}"
-        with correlation_scope(correlation_id):
+        operation_key = call_id or f"tool_call_{uuid4().hex[:8]}"
+        start_wall_ms = time.time_ns() // 1_000_000
+        with self._operation_scope(f"tool.{intent}", operation_id=operation_key) as tool_op:
+            operation_key = tool_op.operation_id
             start_payload = {"tool": intent, "arguments": arguments}
-            tool_start_event = Event(
+            await self.observability.emit(
                 EventType.TOOL_EXECUTION_START,
-                start_payload,
-                metadata=self._event_metadata(request_id, correlation_id),
+                {**start_payload, "start_ms": start_wall_ms},
+                thread=thread,
+                request_id=request_id,
+                operation_id=operation_key,
             )
-            thread.add_event(tool_start_event)
-            await self.callbacks.emit(tool_start_event)
 
-            tool_execution_event = Event(
+            await self.observability.emit(
                 EventType.TOOL_EXECUTION,
                 {"tool": intent, "parameters": arguments},
-                metadata=self._event_metadata(request_id, correlation_id),
+                thread=thread,
+                request_id=request_id,
+                operation_id=operation_key,
             )
-            thread.add_event(tool_execution_event)
-            await self.callbacks.emit(tool_execution_event)
 
             logger.info(
                 "agent.tool.execute",
                 tool=intent,
-                arguments=json.dumps(arguments) if arguments else "{}",
+                arguments=arguments,
             )
 
             start_time = time.perf_counter()
@@ -1025,14 +1206,20 @@ class Agent:
                     f"Tool '{intent}' execution timed out",
                 )
             except TimeoutError as exc:
-                duration_ms = int((time.perf_counter() - start_time) * 1000)
-                error_event = Event(
+                duration_ms = self._elapsed_ms(start_time)
+                await self.observability.emit(
                     EventType.TOOL_ERROR,
-                    {"tool": intent, "error": str(exc), "duration_ms": duration_ms},
-                    metadata=self._event_metadata(request_id, correlation_id),
+                    {
+                        "tool": intent,
+                        "error": str(exc),
+                        "latency_ms": duration_ms,
+                        "start_ms": start_wall_ms,
+                        "end_ms": start_wall_ms + duration_ms,
+                    },
+                    thread=thread,
+                    request_id=request_id,
+                    operation_id=operation_key,
                 )
-                thread.add_event(error_event)
-                await self.callbacks.emit(error_event)
                 result = ToolResult(
                     success=False,
                     error=str(exc),
@@ -1040,29 +1227,85 @@ class Agent:
                 self.metrics[f"tool_error_total"] += 1
                 self.metrics[f"tool_{intent}_error_total"] += 1
             except Exception as exc:
-                duration_ms = int((time.perf_counter() - start_time) * 1000)
-                error_event = Event(
+                duration_ms = self._elapsed_ms(start_time)
+                await self.observability.emit(
                     EventType.TOOL_ERROR,
-                    {"tool": intent, "error": str(exc), "duration_ms": duration_ms},
-                    metadata=self._event_metadata(request_id, correlation_id),
+                    {
+                        "tool": intent,
+                        "error": str(exc),
+                        "latency_ms": duration_ms,
+                        "start_ms": start_wall_ms,
+                        "end_ms": start_wall_ms + duration_ms,
+                    },
+                    thread=thread,
+                    request_id=request_id,
+                    operation_id=operation_key,
                 )
-                thread.add_event(error_event)
-                await self.callbacks.emit(error_event)
                 result = ToolResult(success=False, error=str(exc))
                 self.metrics[f"tool_error_total"] += 1
                 self.metrics[f"tool_{intent}_error_total"] += 1
             else:
-                duration_ms = int((time.perf_counter() - start_time) * 1000)
+                duration_ms = self._elapsed_ms(start_time)
 
             payload = result.to_dict()
-            payload.setdefault("metadata", {})["duration_ms"] = duration_ms
-            tool_result_event = Event(
+            metadata_block = payload.setdefault("metadata", {})
+            metadata_block["duration_ms"] = duration_ms
+            metadata_block["start_ms"] = start_wall_ms
+            metadata_block["end_ms"] = start_wall_ms + duration_ms
+            has_signal = any(
+                value
+                for value in (
+                    payload.get("llm"),
+                    payload.get("display"),
+                    payload.get("data"),
+                )
+                if value not in (None, "", [], {})
+            )
+            quality_label: Optional[str] = None
+            quality_reason: Optional[str] = None
+            if result.success and not has_signal:
+                quality_label = "low"
+                quality_reason = "empty_result"
+            elif intent == "action_plan" and result.success:
+                if not isinstance(result.data, (list, dict)):
+                    quality_label = "low"
+                    quality_reason = "expected_structured_plan"
+            elif intent == "knowledge_base" and result.success:
+                if isinstance(result.data, list) and not result.data:
+                    quality_label = "low"
+                    quality_reason = "knowledge_base_empty"
+            if quality_label:
+                metadata_block["quality"] = quality_label
+                if quality_reason:
+                    metadata_block["quality_reason"] = quality_reason
+                logger.warning(
+                    "agent.tool.result.low_quality",
+                    tool=intent,
+                    call_id=call_id,
+                    operation_id=operation_key,
+                    quality=quality_label,
+                    reason=quality_reason,
+                )
+
+            if (
+                intent == "knowledge_base"
+                and result.success
+                and isinstance(result.data, list)
+                and not result.data
+            ):
+                if self._schedule_web_search_fallback(
+                    thread,
+                    arguments.get("topic") if isinstance(arguments, dict) else None,
+                    request_id=request_id,
+                ):
+                    metadata_block["fallback_scheduled"] = "web_search"
+            await self.observability.emit(
                 EventType.TOOL_RESULT,
                 payload,
-                metadata=self._event_metadata(request_id, correlation_id),
+                thread=thread,
+                request_id=request_id,
+                operation_id=operation_key,
             )
-            thread.add_event(tool_result_event)
-            await self.callbacks.emit(tool_result_event)
             logger.info(
                 "agent.tool.result",
                 tool=intent,
@@ -1070,13 +1313,13 @@ class Agent:
                 duration_ms=duration_ms,
             )
 
-            end_event = Event(
+            await self.observability.emit(
                 EventType.TOOL_EXECUTION_END,
                 {"tool": intent, "success": result.success, "duration_ms": duration_ms},
-                metadata=self._event_metadata(request_id, correlation_id),
+                thread=thread,
+                request_id=request_id,
+                operation_id=operation_key,
             )
-            thread.add_event(end_event)
-            await self.callbacks.emit(end_event)
             self.metrics["tool_call_total"] += 1
             self.metrics["tool_call_duration_ms_total"] += duration_ms or 0
             self.metrics[f"tool_{intent}_call_total"] += 1
@@ -1087,12 +1330,12 @@ class Agent:
         summary = payload.get("llm") or payload.get("display") or payload.get("data")
         if isinstance(summary, (dict, list)):
             summary = json.dumps(summary)
-        thread.add_event(
-            Event(
-                EventType.AGENT_THINKING,
-                {"tool": intent, "result": summary},
-                metadata=self._event_metadata(request_id, correlation_id),
-            )
+        await self.observability.emit(
+            EventType.AGENT_THINKING,
+            {"tool": intent, "result": summary},
+            thread=thread,
+            request_id=request_id,
+            operation_id=operation_key,
         )
         logger.debug(
             "agent.tool.summary",
@@ -1146,16 +1389,18 @@ class Agent:
             payload["summary"] = summary
         final_message = json.dumps(payload, ensure_ascii=False)
         thread.metadata.pop("pending_tool_calls", None)
+        thread.metadata["final_response_message"] = final_message
+        if summary is not None:
+            thread.metadata["final_response_summary"] = summary
         thread.add_message(
             Message("assistant", final_message, metadata={"request_id": request_id} if request_id else {})
         )
-        response_event = Event(
+        await self.observability.emit(
             EventType.AGENT_RESPONSE,
             final_message,
-            metadata=self._event_metadata(request_id),
+            thread=thread,
+            request_id=request_id,
         )
-        thread.add_event(response_event)
-        await self.callbacks.emit(response_event)
         logger.info(
             "agent.final_response",
             message=final_message,
@@ -1163,12 +1408,18 @@ class Agent:
             thread_id=thread.id,
         )
         if summary is not None:
-            info_event = Event(
+            await self.observability.emit(
                 EventType.INFO,
                 {"summary": summary},
-                metadata=self._event_metadata(request_id),
+                thread=thread,
+                request_id=request_id,
             )
-            thread.add_event(info_event)
+        plan_steps = thread.metadata.get("plan_steps", [])
+        plan_index = thread.metadata.get("plan_index", 0)
+        if plan_steps and plan_index < len(plan_steps):
+            for step in plan_steps[plan_index:]:
+                position = step.get("position", plan_index + 1)
+                self._note_plan_skip(thread, position, "final_response_emitted")
         self._complete_remaining_plan_steps(thread)
 
     def _build_messages(
@@ -1370,15 +1621,15 @@ class Agent:
             )
             return
 
-        plan_correlation_id = uuid4().hex[:8]
-        with correlation_scope(plan_correlation_id):
-            start_event = Event(
+        with self._operation_scope("agent.plan") as plan_op:
+            plan_operation_id = plan_op.operation_id
+            await self.observability.emit(
                 EventType.PLAN_GENERATING,
                 {"status": "starting", "thread_id": thread.id},
-                metadata=self._event_metadata(request_id, plan_correlation_id),
+                thread=thread,
+                request_id=request_id,
+                operation_id=plan_operation_id,
             )
-            thread.add_event(start_event)
-            await self.callbacks.emit(start_event)
 
             available_tools: List[str] = []
             if hasattr(self.tool_registry, "tools") and isinstance(self.tool_registry.tools, dict):
@@ -1412,7 +1663,7 @@ class Agent:
 
             try:
                 plan_response = await self._llm_json_call(
-                    planning_messages, PlanResponseModel, thread, request_id=request_id, correlation_id=plan_correlation_id
+                    planning_messages, PlanResponseModel, thread, request_id=request_id, operation_id=plan_operation_id
                 )
                 normalized_steps, parser_used = self._normalize_plan_steps(plan_response)
             except Exception as exc:
@@ -1423,13 +1674,13 @@ class Agent:
                     thread_id=thread.id,
                     duration_ms=duration_ms,
                 )
-                failure_event = Event(
+                await self.observability.emit(
                     EventType.PLAN_GENERATING,
                     {"status": "failed", "error": str(exc), "duration_ms": duration_ms},
-                    metadata=self._event_metadata(request_id, plan_correlation_id),
+                    thread=thread,
+                    request_id=request_id,
+                    operation_id=plan_operation_id,
                 )
-                thread.add_event(failure_event)
-                await self.callbacks.emit(failure_event)
                 if self.config.planning_required:
                     raise RuntimeError("Planning required but failed") from exc
                 return
@@ -1468,20 +1719,20 @@ class Agent:
                 )
             )
             for step in normalized_steps:
-                plan_step_event = Event(
+                await self.observability.emit(
                     EventType.PLAN_STEP,
                     {"step": step, "plan": plan_summary},
-                    metadata=self._event_metadata(request_id, plan_correlation_id),
+                    thread=thread,
+                    request_id=request_id,
+                    operation_id=plan_operation_id,
                 )
-                thread.add_event(plan_step_event)
-                await self.callbacks.emit(plan_step_event)
-            plan_ready_event = Event(
+            await self.observability.emit(
                 EventType.PLAN_GENERATING,
                 {"status": "completed", "steps": len(normalized_steps), "duration_ms": duration_ms},
-                metadata=self._event_metadata(request_id, plan_correlation_id),
+                thread=thread,
+                request_id=request_id,
+                operation_id=plan_operation_id,
             )
-            thread.add_event(plan_ready_event)
-            await self.callbacks.emit(plan_ready_event)
             logger.info(
                 "agent.plan.created",
                 thread_id=thread.id,
@@ -1538,6 +1789,11 @@ class Agent:
             )
         return (steps or None), parser_used
 
+    def _note_plan_skip(self, thread: Thread, position: int, reason: str) -> None:
+        """Record why a particular plan step was skipped."""
+        skips: Dict[int, str] = thread.metadata.setdefault("plan_skips", {})
+        skips[position] = reason
+
     def _record_plan_progress(
         self,
         thread: Thread,
@@ -1563,13 +1819,12 @@ class Agent:
         if reason:
             progress_payload["reason"] = reason
         request_id = thread.metadata.get("last_request_id")
-        thread.add_event(
-            Event(
-                EventType.AGENT_THINKING,
-                progress_payload,
-                metadata=self._event_metadata(request_id),
-            )
+        event = self.observability.event(
+            EventType.AGENT_THINKING,
+            progress_payload,
+            request_id=request_id,
         )
+        thread.add_event(event)
         logger.info(
             "agent.plan.progress",
             thread_id=thread.id,
@@ -1584,14 +1839,49 @@ class Agent:
         plan_steps: List[Dict[str, Any]] = thread.metadata.get("plan_steps", [])
         if not plan_steps:
             return
-        thread.metadata["plan_index"] = len(plan_steps)
-        thread.add_event(
-            Event(
+        plan_index = thread.metadata.get("plan_index", 0)
+        if plan_index < len(plan_steps):
+            skip_map: Dict[int, str] = thread.metadata.get("plan_skips", {})
+            skipped_steps: List[Dict[str, Any]] = []
+            for step in plan_steps[plan_index:]:
+                position = step.get("position", len(skipped_steps) + plan_index + 1)
+                skipped_steps.append(
+                    {
+                        "step": position,
+                        "description": step.get("description"),
+                        "tool": step.get("tool"),
+                        "reason": skip_map.get(position, "not_attempted"),
+                    }
+                )
+            planned = len(plan_steps)
+            coverage = round(plan_index / planned, 3) if planned else 1.0
+            payload = {
+                "planned_steps": planned,
+                "completed_steps": plan_index,
+                "plan_coverage": coverage,
+                "skipped": skipped_steps,
+            }
+            request_id = thread.metadata.get("last_request_id")
+            incomplete_event = self.observability.event(
                 EventType.AGENT_THINKING,
-                {"plan_complete": True, "total_steps": len(plan_steps)},
-                metadata=self._event_metadata(thread.metadata.get("last_request_id")),
+                {"plan_incomplete": payload},
+                request_id=request_id,
             )
+            thread.add_event(incomplete_event)
+            logger.warning(
+                "agent.plan.incomplete",
+                thread_id=thread.id,
+                **payload,
+            )
+            thread.metadata["plan_index"] = len(plan_steps)
+            return
+        thread.metadata["plan_index"] = len(plan_steps)
+        completion_event = self.observability.event(
+            EventType.AGENT_THINKING,
+            {"plan_complete": True, "total_steps": len(plan_steps)},
+            request_id=thread.metadata.get("last_request_id"),
         )
+        thread.add_event(completion_event)
         logger.info("agent.plan.completed", thread_id=thread.id, total=len(plan_steps))
 
     async def _emit_offline_response(self, thread: Thread) -> None:
@@ -1601,8 +1891,13 @@ class Agent:
         )
         logger.warning("agent.offline_response", thread_id=thread.id)
         thread.add_message(Message("assistant", fallback))
-        thread.add_event(Event(EventType.AGENT_RESPONSE, fallback))
-        await self.callbacks.emit(Event(EventType.AGENT_RESPONSE, fallback))
+        thread.metadata["final_response_message"] = fallback
+        thread.metadata.pop("final_response_summary", None)
+        await self.observability.emit(
+            EventType.AGENT_RESPONSE,
+            fallback,
+            thread=thread,
+        )
 
     def _apply_env_defaults(self) -> None:
         """Populate API key/model from environment if not provided."""

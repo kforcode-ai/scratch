@@ -95,6 +95,11 @@ python demos/demo_enhanced_tools.py
 python demos/demo_multi_llm_providers.py
 ```
 
+## 🔍 Observability
+- Structured JSON logging now binds `session_id`, `request_id`, and `operation_id` context by default (see `miniagent_framework/core/logging.py`).
+- LLM call events now include provider token usage metrics and latency budgets when available.
+- Tool executions record duration and flag low-signal outputs to surface weak tool responses quickly.
+
 ## ✨ Key Features
 
 ### Core Framework
@@ -191,9 +196,9 @@ Every interaction carries structured identifiers so you can trace the agent end-
 
 | Concept | Purpose | Where to Inspect |
 |---------|---------|------------------|
-| `thread_id` | Conversation/session identifier spanning multiple user turns. | `Thread.id`, event metadata, structured logs |
-| `request_id` | Unique to a single `agent.run(...)` call. Binds plan generation, tool calls, and final response for that user message. | Event metadata, structlog context (auto-bound) |
-| `correlation_id` | Scoped to individual operations within a request (each LLM call, plan attempt, tool execution). | Event metadata, log entries emitted inside the operation scope |
+| `session_id` / `thread_id` | Conversation identifier spanning multiple user turns. `session_id` is bound into logs; `thread_id` is the persisted value on the `Thread`. | `Thread.id`, event metadata, structured logs |
+| `request_id` | Unique to a single `agent.run(...)` call. Binds plan generation, tool calls, and the final response for that user message. | Event metadata, structlog context (auto-bound) |
+| `operation_id` / `parent_operation_id` | Identifies individual operations within a request (e.g., decision LLM call, streaming pass, tool execution) and the parent that scheduled them. | Event metadata, log entries emitted inside the operation scope |
 | `Event` | Structured record (type, timestamp, content, metadata) emitted for every lifecycle change—planning, tool usage, streaming, clarifications, etc. | `Thread.events`, `StreamCallback` handlers |
 | Session | Higher-level conversation container. By default the `Thread` acts as the in-memory session; Redis/SQLite extensions persist it across processes. | `miniagent_framework/core/core.py`, `extensions/session.py` |
 

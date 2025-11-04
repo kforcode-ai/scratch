@@ -156,8 +156,17 @@ class Thread:
     def summarize_events(self, max_events: int = 10) -> None:
         """Truncate stored events keeping only the most recent entries."""
         if len(self.events) > max_events:
+            removed = len(self.events) - max_events
             self.events = self.events[-max_events:]
-            logger.info("Thread events truncated", extra={"remaining": len(self.events)})
+            cursor = uuid.uuid4().hex[:8]
+            self.metadata["events_cursor"] = cursor
+            logger.info(
+                "thread.events.truncated",
+                thread_id=self.id,
+                cursor=cursor,
+                approx_events_hidden=removed,
+                next_url=f"/threads/{self.id}/events?cursor={cursor}",
+            )
 
     def awaiting_human_response(self) -> bool:
         """Return True if the latest event is a clarification request."""

@@ -119,8 +119,8 @@ class LLMClient:
         Complete a chat with retry logic and circuit breaker
         """
         self._ensure_credentials()
-        logger.info(
-            "llm.complete.call",
+        logger.debug(
+            "llm.call.start",
             provider=self.provider_type.value if isinstance(self.provider_type, LLMProvider) else str(self.provider_type),
             model=self.model,
             stream=stream,
@@ -185,6 +185,7 @@ class LLMClient:
                             stream=False
                         )
                         logger.debug("llm.complete.success", stream=False)
+                        self._record_attempt(attempt)
                         return result
                     except Exception as err:
                         logger.error(
@@ -215,7 +216,27 @@ class LLMClient:
                 raise
         
         raise last_error or Exception("Failed after retries")
-    
+
+    def consume_last_metrics(self) -> Dict[str, Any]:
+        """Return provider-supplied metrics for the most recent call, if any."""
+        if hasattr(self.provider, "last_metadata"):
+            metadata = getattr(self.provider, "last_metadata") or {}
+            if isinstance(metadata, dict):
+                self.provider.last_metadata = {}
+                return dict(metadata)
+        return {}
+
+    def _record_attempt(self, attempt: int) -> None:
+        """Attach retry metadata to the provider's last_metadata store."""
+        if not hasattr(self.provider, "last_metadata"):
+            return
+        existing = getattr(self.provider, "last_metadata") or {}
+        metadata = dict(existing)
+        provider_name = self.provider_type.value if isinstance(self.provider_type, LLMProvider) else str(self.provider_type)
+        metadata.setdefault("provider", provider_name)
+        metadata["retries"] = attempt
+        setattr(self.provider, "last_metadata", metadata)
+
     async def _stream_with_retry(
         self,
         messages: List[Dict[str, str]],
@@ -233,6 +254,7 @@ class LLMClient:
                 tools=tools,
                 stream=True
             )
+            self._record_attempt(attempt)
             logger.debug("llm.complete.success", stream=True)
             async for chunk in stream_result:
                 yield chunk

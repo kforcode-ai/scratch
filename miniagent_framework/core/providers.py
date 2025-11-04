@@ -20,6 +20,7 @@ class BaseLLMProvider(ABC):
         self.api_key = api_key
         self.model = model
         self.client = None
+        self.last_metadata: Dict[str, Any] = {}
         self._initialize_client()
     
     @abstractmethod
@@ -94,9 +95,36 @@ class OpenAIProvider(BaseLLMProvider):
             response = await self.client.chat.completions.create(**kwargs)
             return self._parse_response(response)
     
+    @staticmethod
+    def _usage_to_dict(usage: Any) -> Dict[str, Any]:
+        if usage is None:
+            return {}
+        metadata: Dict[str, Any] = {}
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = getattr(usage, field, None)
+            if value is not None:
+                metadata[field] = int(value)
+        cached = getattr(usage, "prompt_tokens_details", None)
+        if cached and isinstance(cached, dict):
+            cached_tokens = cached.get("cached_tokens")
+            if cached_tokens is not None:
+                metadata["cached_tokens"] = int(cached_tokens)
+        return metadata
+    
     def _parse_response(self, response) -> Union[str, Dict]:
         """Parse OpenAI response"""
         message = response.choices[0].message
+        usage_meta = self._usage_to_dict(getattr(response, "usage", None))
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        metadata: Dict[str, Any] = {
+            "model": getattr(response, "model", self.model),
+            "stream": False,
+        }
+        if usage_meta:
+            metadata.update(usage_meta)
+        if finish_reason:
+            metadata["finish_reason"] = finish_reason
+        self.last_metadata = metadata
         
         # Check for tool calls
         if hasattr(message, 'tool_calls') and message.tool_calls:
@@ -117,9 +145,22 @@ class OpenAIProvider(BaseLLMProvider):
     async def _stream_response(self, stream) -> AsyncIterator:
         """Stream OpenAI response"""
         tool_calls_buffer = {}
+        self.last_metadata = {"model": self.model, "stream": True}
         
         async for chunk in stream:
-            delta = chunk.choices[0].delta
+            choices = getattr(chunk, "choices", None)
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            finish_reason = getattr(choice, "finish_reason", None)
+            usage_meta = self._usage_to_dict(getattr(chunk, "usage", None))
+            if usage_meta:
+                self.last_metadata.update(usage_meta)
+            if finish_reason:
+                self.last_metadata["finish_reason"] = finish_reason
             
             # Handle content
             if delta.content:
@@ -196,6 +237,11 @@ class GeminiProvider(BaseLLMProvider):
         """Complete using Gemini API"""
         if not self.client:
             raise RuntimeError("Gemini client not initialized. Please provide GOOGLE_API_KEY or GEMINI_API_KEY.")
+        self.last_metadata = {
+            "model": self.model,
+            "provider": "gemini",
+            "stream": stream,
+        }
         
         # Convert messages to Gemini format
         gemini_messages = self._convert_messages(messages)
@@ -292,6 +338,7 @@ class GeminiProvider(BaseLLMProvider):
     
     async def _stream_response(self, response_stream) -> AsyncIterator:
         """Stream Gemini response"""
+        self.last_metadata["stream"] = True
         for chunk in response_stream:
             if chunk.text:
                 yield chunk.text
@@ -342,6 +389,11 @@ class AnthropicProvider(BaseLLMProvider):
         """Complete using Anthropic API"""
         if not self.client:
             raise RuntimeError("Anthropic client not initialized. Please provide ANTHROPIC_API_KEY.")
+        self.last_metadata = {
+            "model": self.model,
+            "provider": "anthropic",
+            "stream": stream,
+        }
         
         # Convert messages to Anthropic format
         system_prompt, claude_messages = self._convert_messages(messages)
@@ -445,4 +497,3 @@ class AnthropicProvider(BaseLLMProvider):
                             "arguments": json.dumps(event.content_block.input)
                         }]
                     }
-
