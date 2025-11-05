@@ -6,10 +6,12 @@ import json
 import os
 import re
 import time
+import hashlib
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Dict, List, Optional, Literal, Type, Union, Tuple, Awaitable
 from uuid import uuid4
+from weakref import WeakKeyDictionary
 
 from pydantic import BaseModel, Field, ValidationError, model_validator, ConfigDict
 from structlog.contextvars import clear_contextvars
@@ -45,7 +47,7 @@ class AgentConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "AgentConfig":
-        object.__setattr__(self, "provider", self.provider.lower())
+        self.provider = self.provider.lower()
         if not 0 <= self.temperature <= 2:
             raise ValueError("temperature must be between 0 and 2")
         if self.max_tokens <= 0:
@@ -159,6 +161,8 @@ class Agent:
         self.metrics: Counter[str] = Counter()
         if os.getenv("MINIAGENT_EVENT_LOG", "0") == "1":
             self.callbacks.on_any(self._log_event_telemetry)
+        # Store turn states as runtime attributes, not in metadata
+        self._turn_states: WeakKeyDictionary[Thread, TurnState] = WeakKeyDictionary()
 
     @staticmethod
     def _monotonic_ns() -> int:
@@ -174,15 +178,30 @@ class Agent:
     def _now_ms() -> int:
         return time.time_ns() // 1_000_000
 
+    @staticmethod
+    def _strip_markdown_code_fence(text: str) -> str:
+        if not text.startswith("```"):
+            return text
+        lines = text.splitlines()
+        if not lines:
+            return text
+        if not lines[0].startswith("```"):
+            return text
+        for idx, line in enumerate(lines[1:], start=1):
+            if line.strip() == "```":
+                return "\n".join(lines[1:idx]).strip()
+        return "\n".join(lines[1:]).strip()
+
     @property
     def offline(self) -> bool:
         return self.llm.client is None
 
     def _get_turn_state(self, thread: Thread) -> TurnState:
-        state = thread.metadata.get("_turn_state")
-        if isinstance(state, TurnState):
-            return state
+        # Check runtime attribute first
+        if thread in self._turn_states:
+            return self._turn_states[thread]
 
+        # Reconstruct from persisted metadata
         plan_state = PlanState(
             summary=thread.metadata.get("plan"),
             steps=list(thread.metadata.get("plan_steps", []) or []),
@@ -201,74 +220,52 @@ class Agent:
             final_response_summary=thread.metadata.get("final_response_summary"),
             plan=plan_state,
         )
-        thread.metadata["_turn_state"] = state
+        # Store in runtime cache
+        self._turn_states[thread] = state
         return state
 
     def _save_turn_state(self, thread: Thread, state: TurnState) -> None:
-        thread.metadata["_turn_state"] = state
-
-        if state.current_user_message_ts is not None:
-            thread.metadata["current_user_message_ts"] = state.current_user_message_ts
-        else:
-            thread.metadata.pop("current_user_message_ts", None)
-
-        if state.last_request_id is not None:
-            thread.metadata["last_request_id"] = state.last_request_id
-        else:
-            thread.metadata.pop("last_request_id", None)
-
-        if state.pending_tool_calls:
-            thread.metadata["pending_tool_calls"] = list(state.pending_tool_calls)
-        else:
-            thread.metadata.pop("pending_tool_calls", None)
-
-        if state.fallback_scheduled:
-            thread.metadata["fallback_scheduled"] = list(state.fallback_scheduled)
-        else:
-            thread.metadata.pop("fallback_scheduled", None)
-
-        if state.final_response_message is not None:
-            thread.metadata["final_response_message"] = state.final_response_message
-        else:
-            thread.metadata.pop("final_response_message", None)
-
-        if state.final_response_summary is not None:
-            thread.metadata["final_response_summary"] = state.final_response_summary
-        else:
-            thread.metadata.pop("final_response_summary", None)
-
+        # Store in runtime cache
+        self._turn_states[thread] = state
+        
+        # Helper to set or remove metadata
+        def _set_or_remove(key: str, value: Any) -> None:
+            if value is not None and (not isinstance(value, (list, dict)) or value):
+                thread.metadata[key] = value
+            else:
+                thread.metadata.pop(key, None)
+        
+        # Persist JSON-friendly fields only
+        _set_or_remove("current_user_message_ts", state.current_user_message_ts)
+        _set_or_remove("last_request_id", state.last_request_id)
+        _set_or_remove("pending_tool_calls", list(state.pending_tool_calls) if state.pending_tool_calls else None)
+        _set_or_remove("fallback_scheduled", list(state.fallback_scheduled) if state.fallback_scheduled else None)
+        _set_or_remove("final_response_message", state.final_response_message)
+        _set_or_remove("final_response_summary", state.final_response_summary)
+        
+        # Plan fields
         plan = state.plan
-        if plan.summary:
-            thread.metadata["plan"] = plan.summary
-        else:
-            thread.metadata.pop("plan", None)
+        _set_or_remove("plan", plan.summary)
+        _set_or_remove("plan_steps", list(plan.steps) if plan.steps else None)
+        thread.metadata["plan_index"] = plan.index  # Always keep index
+        _set_or_remove("plan_parser", plan.parser)
+        _set_or_remove("plan_raw", plan.raw)
+        _set_or_remove("plan_skips", dict(plan.skips) if plan.skips else None)
+        _set_or_remove("plan_message_ts", plan.message_ts)
 
-        if plan.steps:
-            thread.metadata["plan_steps"] = list(plan.steps)
-        else:
-            thread.metadata.pop("plan_steps", None)
-
-        thread.metadata["plan_index"] = plan.index
-
-        if plan.parser:
-            thread.metadata["plan_parser"] = plan.parser
-        else:
-            thread.metadata.pop("plan_parser", None)
-
-        if plan.raw is not None:
-            thread.metadata["plan_raw"] = plan.raw
-        else:
-            thread.metadata.pop("plan_raw", None)
-
-        if plan.skips:
-            thread.metadata["plan_skips"] = dict(plan.skips)
-        else:
-            thread.metadata.pop("plan_skips", None)
-
-        if plan.message_ts is not None:
-            thread.metadata["plan_message_ts"] = plan.message_ts
-        else:
-            thread.metadata.pop("plan_message_ts", None)
+    def _set_final_response(
+        self,
+        thread: Thread,
+        message: Optional[str],
+        summary: Optional[Any],
+        *,
+        state: Optional[TurnState] = None,
+    ) -> TurnState:
+        state = state or self._get_turn_state(thread)
+        state.final_response_message = message
+        state.final_response_summary = summary
+        self._save_turn_state(thread, state)
+        return state
 
     def metrics_snapshot(self) -> Dict[str, int]:
         """Return a shallow copy of collected metrics for external reporting."""
@@ -306,6 +303,34 @@ class Agent:
             ttft_ms=ttft_ms,
         )
 
+    async def _record_llm_error(
+        self,
+        exc: Exception,
+        *,
+        phase: Optional[str],
+        start_ns: int,
+        start_ms: int,
+        thread: Optional[Thread],
+        event_id: str,
+    ) -> int:
+        duration_ms = self._elapsed_ms(start_ns)
+        payload: Dict[str, Any] = {
+            "error": str(exc),
+            "latency_ms": duration_ms,
+            "start_ms": start_ms,
+            "end_ms": start_ms + duration_ms,
+        }
+        if phase:
+            payload["phase"] = phase
+        await self.observability.emit(
+            EventType.LLM_ERROR,
+            payload,
+            thread=thread,
+            event_id=event_id,
+        )
+        self.metrics["llm_error_total"] += 1
+        return duration_ms
+
     def _schedule_web_search_fallback(
         self,
         thread: Thread,
@@ -322,7 +347,10 @@ class Agent:
             if call.get("name") == "web_search":
                 return False
         fallback_markers = state.fallback_scheduled
-        marker = f"{state.current_user_message_ts or ''}|web_search"
+        # More specific marker including query hash
+        query = (topic or "").strip() or thread.get_last_user_message() or ""
+        query_hash = hashlib.md5(query.encode()).hexdigest()[:8]
+        marker = f"{state.current_user_message_ts or ''}|web_search|{query_hash}"
         if marker in fallback_markers:
             return False
         query = (topic or "").strip()
@@ -363,6 +391,8 @@ class Agent:
         current_ts = message.timestamp.isoformat()
         state.current_user_message_ts = current_ts
         state.last_request_id = request_id
+        # Clear pending tool calls from previous turn
+        state.pending_tool_calls.clear()
         if not state.plan.summary or last_planned_ts != current_ts:
             self._reset_plan_state(thread, state=state)
         state.final_response_message = None
@@ -385,10 +415,19 @@ class Agent:
     ) -> Any:
         if timeout is None:
             return await coro
+        
+        # Create explicit task for better cancellation control
+        task = asyncio.create_task(coro)
         try:
-            return await asyncio.wait_for(coro, timeout=timeout)
-        except asyncio.TimeoutError as exc:
-            raise TimeoutError(timeout_message) from exc
+            return await asyncio.wait_for(task, timeout=timeout)
+        except asyncio.TimeoutError:
+            # Ensure task is cancelled properly
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            raise TimeoutError(timeout_message) from None
 
     async def run(
         self,
@@ -442,17 +481,21 @@ class Agent:
 
                     for event in reversed(thread.events):
                         if event.type == EventType.AGENT_RESPONSE and isinstance(event.data, str):
-                            state.final_response_message = event.data
-                            state.final_response_summary = None
-                            self._save_turn_state(thread, state)
-                            thread.metadata.pop("final_response_payload", None)
+                            self._set_final_response(
+                                thread,
+                                event.data,
+                                None,
+                                state=state,
+                            )
                             return event.data
 
                     fallback = "I'm sorry, I couldn't produce an answer this time."
-                    state.final_response_message = fallback
-                    state.final_response_summary = None
-                    self._save_turn_state(thread, state)
-                    thread.metadata.pop("final_response_payload", None)
+                    self._set_final_response(
+                        thread,
+                        fallback,
+                        None,
+                        state=state,
+                    )
                     await self.observability.emit(
                         EventType.AGENT_RESPONSE,
                         fallback,
@@ -480,11 +523,7 @@ class Agent:
                 fallback = f"Configuration issue: {exc}"
             else:
                 fallback = "I'm sorry, I ran into an internal error while responding."
-            state = self._get_turn_state(thread)
-            state.final_response_message = fallback
-            state.final_response_summary = None
-            self._save_turn_state(thread, state)
-            thread.metadata.pop("final_response_payload", None)
+            self._set_final_response(thread, fallback, None)
             await self.observability.emit(
                 EventType.AGENT_RESPONSE,
                 fallback,
@@ -568,12 +607,17 @@ class Agent:
                 return
 
             if action.action == "fallback":
-                await self._finalize_response(
-                    thread,
-                    context,
-                    request_id=request_id,
-                    fallback_message=action.message,
-                )
+                # If we have a message from the decision phase, use it directly
+                if action.message:
+                    await self._commit_final_response(
+                        action.message, None, thread, request_id=request_id
+                    )
+                else:
+                    await self._finalize_response(
+                        thread,
+                        context,
+                        request_id=request_id,
+                    )
                 yield thread
                 return
 
@@ -636,19 +680,14 @@ class Agent:
                 "LLM request timed out",
             )
         except Exception as exc:
-            duration_ms = self._elapsed_ms(start_ns)
-            await self.observability.emit(
-                EventType.LLM_ERROR,
-                {
-                    "error": str(exc),
-                    "latency_ms": duration_ms,
-                    "start_ms": start_wall_ms,
-                    "end_ms": start_wall_ms + duration_ms,
-                },
+            await self._record_llm_error(
+                exc,
+                phase=None,
+                start_ns=start_ns,
+                start_ms=start_wall_ms,
                 thread=thread,
                 event_id=llm_event,
             )
-            self.metrics["llm_error_total"] += 1
             raise
 
         if isinstance(raw, dict):
@@ -656,7 +695,7 @@ class Agent:
         else:
             payload = str(raw)
 
-        payload = payload.strip()
+        payload = self._strip_markdown_code_fence(payload.strip())
         if not payload:
             raise ValueError("Empty response from LLM")
 
@@ -877,14 +916,26 @@ class Agent:
                         arguments=next_call["arguments"],
                         tool_call_id=next_call["id"],
                     )
-            else:
-                logger.warning(
-                    "agent.tool_call.parsing_failed",
-                    session_id=thread.id,
-                    payload=tool_calls_payload,
-                )
 
         action_result = self._parse_final_action(decision_result.final_text)
+        
+        # If the LLM returned plain text (not JSON), treat it as a final response
+        if action_result.action == "final" and action_result.message:
+            # Check if this is actually unstructured text by seeing if it contains newlines or markdown
+            text = str(action_result.message)
+            if text and ("\n" in text or "**" in text or text.startswith("1.") or text.startswith("-")):
+                logger.warning(
+                    "agent.decision.unstructured_response",
+                    session_id=thread.id,
+                    iteration=iteration,
+                )
+                # Return as fallback to trigger finalization with this content
+                return ActionResult(
+                    action="fallback",
+                    message=text,
+                    summary=None,
+                )
+        
         if action_result.action == "fallback":
             logger.warning(
                 "agent.decision.unstructured_response",
@@ -1024,20 +1075,14 @@ class Agent:
                     event_id=decision_event,
                 )
             except Exception as exc:
-                latency_ms = self._elapsed_ms(start_ns)
-                await self.observability.emit(
-                    EventType.LLM_ERROR,
-                    {
-                        "error": str(exc),
-                        "phase": "decision",
-                        "latency_ms": latency_ms,
-                        "start_ms": start_ms,
-                        "end_ms": start_ms + latency_ms,
-                    },
+                await self._record_llm_error(
+                    exc,
+                    phase="decision",
+                    start_ns=start_ns,
+                    start_ms=start_ms,
                     thread=thread,
                     event_id=decision_event,
                 )
-                self.metrics["llm_error_total"] += 1
                 raise
 
             latency_ms = result.metrics.get("latency_ms")
@@ -1062,20 +1107,14 @@ class Agent:
                 "LLM decision timed out",
             )
         except Exception as exc:
-            latency_ms = self._elapsed_ms(start_ns)
-            await self.observability.emit(
-                EventType.LLM_ERROR,
-                {
-                    "error": str(exc),
-                    "phase": "decision",
-                    "latency_ms": latency_ms,
-                    "start_ms": start_ms,
-                    "end_ms": start_ms + latency_ms,
-                },
+            await self._record_llm_error(
+                exc,
+                phase="decision",
+                start_ns=start_ns,
+                start_ms=start_ms,
                 thread=thread,
                 event_id=decision_event,
             )
-            self.metrics["llm_error_total"] += 1
             raise
 
         logger.debug(
@@ -1121,11 +1160,15 @@ class Agent:
                     action="fallback",
                     message="I'm sorry, I wasn't able to generate a response just now.",
                 )
+
+            serialized_text = self._strip_markdown_code_fence(serialized_text)
+
             try:
                 raw_payload = json.loads(serialized_text)
             except json.JSONDecodeError:
+                # Fallback to regex for embedded JSON
                 json_match = re.search(
-                    r"```(?:json)?\s*(\{.*\})\s*```", serialized_text, re.DOTALL
+                    r"```(?:json)?\s*(\{.*\})\s*```", str(final_text).strip(), re.DOTALL
                 )
                 if json_match:
                     try:
@@ -1137,6 +1180,13 @@ class Agent:
             clarification_requested = bool(raw_payload.get("clarification"))
 
         if raw_payload is None:
+            # If JSON parsing failed completely, treat the original text as the message
+            if serialized_text and isinstance(serialized_text, str):
+                return ActionResult(
+                    action="final",
+                    message=serialized_text,
+                    summary=None,
+                )
             return ActionResult(
                 action="fallback",
                 message="",
@@ -1166,14 +1216,25 @@ class Agent:
 
     def _extract_tool_calls(self, raw_response: Any) -> List[Dict[str, Any]]:
         if isinstance(raw_response, dict):
+            # Direct tool_calls field
             tool_calls = raw_response.get("tool_calls")
             if isinstance(tool_calls, list):
                 return tool_calls
-            if (
-                raw_response.get("type") == "tool_calls"
-                and isinstance(tool_calls, list)
-            ):
-                return tool_calls
+            
+            # OpenAI-like envelope format
+            choices = raw_response.get("choices")
+            if isinstance(choices, list) and choices:
+                message = choices[0].get("message")
+                if isinstance(message, dict):
+                    tool_calls = message.get("tool_calls")
+                    if isinstance(tool_calls, list):
+                        return tool_calls
+            
+            # Type-based format
+            if raw_response.get("type") == "tool_calls":
+                tool_calls = raw_response.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    return tool_calls
         return []
 
     def _prepare_tool_calls(
@@ -1181,13 +1242,13 @@ class Agent:
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         formatted_for_messages: List[Dict[str, Any]] = []
         pending_calls: List[Dict[str, Any]] = []
-        invalid_calls: List[Dict[str, Any]] = []
+        invalid_count = 0
 
         for raw_call in raw_calls:
             try:
                 call = ToolCallModel.model_validate(raw_call)
-            except ValidationError as exc:
-                invalid_calls.append({"payload": raw_call, "error": str(exc)})
+            except ValidationError:
+                invalid_count += 1
                 continue
 
             name = call.name
@@ -1231,11 +1292,12 @@ class Agent:
                 }
             )
 
-        if invalid_calls:
-            logger.warning(
-                "agent.tool_call.validation_failed",
-                failures=len(invalid_calls),
-                samples=[item["payload"] for item in invalid_calls[:3]],
+        # Report invalid count once if any
+        if invalid_count > 0:
+            logger.debug(
+                "agent.tool_call.invalid_calls",
+                invalid_count=invalid_count,
+                total_calls=len(raw_calls),
             )
 
         return formatted_for_messages, pending_calls
@@ -1289,14 +1351,15 @@ class Agent:
         if isinstance(raw_response, str):
             return raw_response
         if isinstance(raw_response, dict):
+            # Look for known text fields
             for key in ("message", "content", "text", "response"):
                 value = raw_response.get(key)
                 if isinstance(value, str):
                     return value
-        try:
-            return json.dumps(raw_response, ensure_ascii=False)
-        except (TypeError, ValueError):
-            return str(raw_response)
+            # For dicts without clear text fields, return None to avoid ambiguity
+            return None
+        # Non-dict, non-string types
+        return None
 
     async def _finalize_response(
         self,
@@ -1367,17 +1430,17 @@ class Agent:
             )
         except Exception as exc:
             logger.error("Final response generation failed", error=str(exc))
-            fallback = (
-                fallback_message
-                or "I'm sorry, I couldn't generate a response right now."
-            )
+            # Check if we have a fallback message from the decision phase
+            if fallback_message and isinstance(fallback_message, str):
+                # Use the actual content from the decision phase
+                fallback = fallback_message
+            else:
+                fallback = "I'm sorry, I couldn't generate a response right now."
+            
             if isinstance(fallback, dict):
                 fallback = json.dumps(fallback, ensure_ascii=False)
             thread.add_message(Message("assistant", fallback))
-            state.final_response_message = fallback
-            state.final_response_summary = None
-            self._save_turn_state(thread, state)
-            thread.metadata.pop("final_response_payload", None)
+            self._set_final_response(thread, fallback, None, state=state)
             await self.observability.emit(
                 EventType.AGENT_RESPONSE,
                 fallback,
@@ -1432,26 +1495,6 @@ class Agent:
                 self.config.tool_timeout,
                 f"Tool '{intent}' execution timed out",
             )
-        except TimeoutError as exc:
-            duration_ms = self._elapsed_ms(start_ns)
-            await self.observability.emit(
-                EventType.TOOL_ERROR,
-                {
-                    "tool": intent,
-                    "error": str(exc),
-                    "latency_ms": duration_ms,
-                    "start_ms": start_wall_ms,
-                    "end_ms": start_wall_ms + duration_ms,
-                },
-                thread=thread,
-                event_id=tool_event,
-            )
-            result = ToolResult(
-                success=False,
-                error=str(exc),
-            )
-            self.metrics["tool_error_total"] += 1
-            self.metrics[f"tool_{intent}_error_total"] += 1
         except Exception as exc:
             duration_ms = self._elapsed_ms(start_ns)
             await self.observability.emit(
@@ -1487,19 +1530,8 @@ class Agent:
             )
             if value not in (None, "", [], {})
         )
-        quality_label: Optional[str] = None
-        quality_reason: Optional[str] = None
-        if result.success and not has_signal:
-            quality_label = "low"
-            quality_reason = "empty_result"
-        elif intent == "action_plan" and result.success:
-            if not isinstance(result.data, (list, dict)):
-                quality_label = "low"
-                quality_reason = "expected_structured_plan"
-        elif intent == "knowledge_base" and result.success:
-            if isinstance(result.data, list) and not result.data:
-                quality_label = "low"
-                quality_reason = "knowledge_base_empty"
+        # Assess tool result quality
+        quality_label, quality_reason = self._assess_tool_quality(intent, result, has_signal)
         if quality_label:
             metadata_block["quality"] = quality_label
             if quality_reason:
@@ -1617,10 +1649,13 @@ class Agent:
 
         state = self._get_turn_state(thread)
         state.pending_tool_calls.clear()
-        state.final_response_message = visible_message
-        state.final_response_summary = summary
-        self._save_turn_state(thread, state)
-        thread.metadata["final_response_payload"] = payload
+        state = self._set_final_response(
+            thread,
+            visible_message,
+            summary,
+            state=state,
+        )
+        # Store payload only in message metadata, not thread metadata
 
         message_metadata: Dict[str, Any] = {"response_payload": payload}
         if request_id:
@@ -1665,13 +1700,19 @@ class Agent:
         iteration: int = 0,
         mode: str = "decision",
     ) -> List[Dict[str, Any]]:
+        # Build complete system message content
+        system_parts = [self.config.system_prompt]
+        
+        # Add tool metadata
         metadata = self._tool_metadata()
-        system_content = self.config.system_prompt
         if metadata:
-            system_content += f"\n\nAvailable tools:\n{metadata}"
+            system_parts.append(f"Available tools:\n{metadata}")
+        
+        # Add context
         if context:
-            system_content += f"\n\nContext:\n{context}"
-
+            system_parts.append(f"Context:\n{context}")
+        
+        # Add plan information if available
         if thread:
             state = self._get_turn_state(thread)
             plan_summary = state.plan.summary
@@ -1679,8 +1720,8 @@ class Agent:
             plan_index = state.plan.index
             if plan_summary:
                 if iteration == 0:
-                    system_content += (
-                        "\n\nPlanned workflow (execute sequentially):\n"
+                    system_parts.append(
+                        "Planned workflow (execute sequentially):\n"
                         f"{plan_summary}\n"
                         "Follow the steps in order. Think through each step internally, "
                         "call tools when required, and verify success criteria before moving on."
@@ -1699,15 +1740,16 @@ class Agent:
                         step_instructions += (
                             "Integrate prior tool results, reason carefully, and confirm the success criteria."
                         )
-                        system_content += f"\n\n{step_instructions}"
+                        system_parts.append(step_instructions)
                     else:
-                        system_content += (
-                            "\n\nAll planned steps have been attempted. Consolidate findings and prepare the final response."
+                        system_parts.append(
+                            "All planned steps have been attempted. Consolidate findings and prepare the final response."
                         )
-
+        
+        # Add mode-specific instructions
         if mode == "decision":
-            system_content += (
-                "\n\nDecision protocol:\n"
+            system_parts.append(
+                "Decision protocol:\n"
                 "- Decide whether to continue the reasoning with a tool call or respond directly.\n"
                 "- Call a tool when its output is required to answer confidently.\n"
                 "- When no tool is needed, reply by emitting STRICT JSON with keys 'message' and optional 'summary'.\n"
@@ -1715,13 +1757,20 @@ class Agent:
                 "- Always keep the user-facing response concise and helpful."
             )
         elif mode == "final":
-            system_content += (
-                "\n\nCompose the final user-facing answer summarizing tool evidence. Respond as JSON with keys 'message', optional 'summary', and include 'clarification': true if you still need more information."
+            system_parts.append(
+                "Compose the final user-facing answer summarizing tool evidence. Respond as JSON with keys 'message', optional 'summary', and include 'clarification': true if you still need more information."
             )
+        
+        # Add the specific prompt/instruction
+        system_parts.append(prompt)
+        
+        # Create single system message
+        system_content = "\n\n".join(system_parts)
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_content}
         ]
-
+        
+        # Add conversation history
         if thread:
             for message in thread.messages:
                 meta = message.metadata or {}
@@ -1730,17 +1779,16 @@ class Agent:
                 role = message.role
                 content = message.content or ""
                 message_payload: Dict[str, Any] = {"role": role, "content": content}
-
+                
                 if message.tool_calls:
                     message_payload["tool_calls"] = message.tool_calls
                 if message.tool_call_id:
                     message_payload["tool_call_id"] = message.tool_call_id
                 if message.name:
                     message_payload["name"] = message.name
-
+                
                 messages.append(message_payload)
-
-        messages.append({"role": "system", "content": prompt})
+        
         return messages
 
     def _tool_metadata(self) -> str:
@@ -1758,6 +1806,10 @@ class Agent:
         context: Optional[str],
     ) -> bool:
         if not user_message:
+            return False
+
+        # Skip planning if no tools are registered
+        if not self.tool_registry.tools:
             return False
 
         message_text = user_message.strip()
@@ -2108,24 +2160,35 @@ class Agent:
         )
         logger.warning("agent.offline_response", session_id=thread.id)
         thread.add_message(Message("assistant", fallback))
-        state = self._get_turn_state(thread)
-        state.final_response_message = fallback
-        state.final_response_summary = None
-        self._save_turn_state(thread, state)
+        self._set_final_response(thread, fallback, None)
         await self.observability.emit(
             EventType.AGENT_RESPONSE,
             fallback,
             thread=thread,
         )
 
+    def _assess_tool_quality(
+        self,
+        intent: str,
+        result: ToolResult,
+        has_signal: bool
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Assess the quality of a tool result."""
+        if result.success and not has_signal:
+            return "low", "empty_result"
+        elif intent == "action_plan" and result.success:
+            if not isinstance(result.data, (list, dict)):
+                return "low", "expected_structured_plan"
+        elif intent == "knowledge_base" and result.success:
+            if isinstance(result.data, list) and not result.data:
+                return "low", "knowledge_base_empty"
+        return None, None
+
     def _apply_env_defaults(self) -> None:
         """Populate API key/model from environment if not provided."""
         provider = self.config.provider.lower()
-        fields_set = getattr(
-            self.config,
-            "model_fields_set",
-            getattr(self.config, "__fields_set__", set()),
-        )
+        # Get fields that were explicitly set in Pydantic v2
+        fields_set = self.config.model_fields_set if hasattr(self.config, "model_fields_set") else set()
 
         api_key_sources = [
             f"{provider.upper()}_API_KEY",  # e.g. OPENAI_API_KEY
