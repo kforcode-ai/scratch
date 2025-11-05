@@ -1,184 +1,74 @@
-"""Observability helpers for session/request/operation scoped telemetry."""
+"""Simplified observability helpers for session/request scoped telemetry."""
 from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional
 from uuid import uuid4
-
-from structlog.contextvars import bind_contextvars, get_contextvars, unbind_contextvars
 
 from .events import Event, EventType, StreamCallback
 
 
 @dataclass
-class ObservabilityState:
-    """Session/request identifiers kept in contextvars for observability."""
+class ObservabilityContext:
+    """Minimal context shared across a session and its active request."""
 
     session_id: str
-    request_id: str
-    trace_id: str
-    thread_id: Optional[str] = None
+    request_id: Optional[str] = None
 
 
-@dataclass
-class OperationContext:
-    """Operation-level metadata for hierarchical observability."""
-
-    operation_id: str
-    operation_type: str
-    parent_operation_id: Optional[str] = None
-
-
-_observability_state: ContextVar[Optional[ObservabilityState]] = ContextVar(
-    "miniagent_observability_state", default=None
-)
-_operation_stack: ContextVar[Tuple[OperationContext, ...]] = ContextVar(
-    "miniagent_operation_stack", default=()
+_observability_context: ContextVar[Optional[ObservabilityContext]] = ContextVar(
+    "miniagent_observability_context",
+    default=None,
 )
 
 
 class Observability:
-    """Helper for consistent event metadata, operation scoping, and emissions."""
+    """Helper for binding session/request identifiers and emitting events."""
 
     def __init__(self, callbacks: StreamCallback) -> None:
         self.callbacks = callbacks
 
     @staticmethod
-    def _restore_context(previous: Dict[str, Any], keys: Tuple[str, ...]) -> None:
-        """Restore structlog contextvars that were overridden in the scope."""
-        for key in keys:
-            if key in previous:
-                bind_contextvars(**{key: previous[key]})
-            else:
-                try:
-                    unbind_contextvars(key)
-                except LookupError:
-                    pass
+    def new_event_id() -> str:
+        """Return a short identifier for the most atomic telemetry event."""
+        return uuid4().hex[:8]
 
     @contextmanager
-    def session_scope(
-        self,
-        *,
-        session_id: str,
-        request_id: str,
-        trace_id: Optional[str] = None,
-        thread_id: Optional[str] = None,
-    ) -> Iterator[ObservabilityState]:
-        """Bind a unified session/request context for observability."""
-        state = ObservabilityState(
-            session_id=session_id,
-            request_id=request_id,
-            trace_id=trace_id or request_id,
-            thread_id=thread_id or session_id,
+    def session_scope(self, *, session_id: str) -> Iterator[ObservabilityContext]:
+        """Bind a session for the duration of the scope."""
+        token: Token[Optional[ObservabilityContext]] = _observability_context.set(
+            ObservabilityContext(session_id=session_id)
         )
-        state_token: Token[Optional[ObservabilityState]] = _observability_state.set(state)
-        stack_token: Token[Tuple[OperationContext, ...]] = _operation_stack.set(tuple())
-        previous = get_contextvars()
-
-        bindings: Dict[str, Any] = {
-            "session_id": state.session_id,
-            "conversation_id": state.session_id,
-            "thread_id": state.thread_id,
-            "request_id": state.request_id,
-            "trace_id": state.trace_id,
-        }
-        for key, value in list(bindings.items()):
-            if value is None:
-                bindings.pop(key)
-        binding_keys = tuple(bindings.keys())
-        if bindings:
-            bind_contextvars(**bindings)
-
         try:
-            yield state
+            yield _observability_context.get()
         finally:
-            _operation_stack.reset(stack_token)
-            _observability_state.reset(state_token)
-            self._restore_context(previous, binding_keys)
+            _observability_context.reset(token)
 
     @contextmanager
-    def operation_scope(
-        self,
-        operation_type: str,
-        *,
-        operation_id: Optional[str] = None,
-        attributes: Optional[Dict[str, Any]] = None,
-    ) -> Iterator[OperationContext]:
-        """Bind operation-level identifiers, returning the created context."""
-        state = _observability_state.get()
-        if state is None:
-            raise RuntimeError("operation_scope requires an active session_scope")
-
-        stack = _operation_stack.get(tuple())
-        parent = stack[-1].operation_id if stack else None
-        op_context = OperationContext(
-            operation_id=operation_id or uuid4().hex[:8],
-            operation_type=operation_type,
-            parent_operation_id=parent,
+    def request_scope(self, request_id: str) -> Iterator[ObservabilityContext]:
+        """Bind a request nested under the active session."""
+        current = _observability_context.get()
+        if current is None:
+            raise RuntimeError("request_scope requires an active session_scope")
+        token: Token[Optional[ObservabilityContext]] = _observability_context.set(
+            ObservabilityContext(session_id=current.session_id, request_id=request_id)
         )
-        stack_token: Token[Tuple[OperationContext, ...]] = _operation_stack.set(stack + (op_context,))
-        previous = get_contextvars()
-
-        bindings: Dict[str, Any] = {
-            "session_id": state.session_id,
-            "conversation_id": state.session_id,
-            "thread_id": state.thread_id,
-            "request_id": state.request_id,
-            "trace_id": state.trace_id,
-            "operation_id": op_context.operation_id,
-            "operation_type": op_context.operation_type,
-            "parent_operation_id": op_context.parent_operation_id,
-        }
-        if attributes:
-            bindings.update({k: v for k, v in attributes.items() if v is not None})
-        cleaned_bindings = {k: v for k, v in bindings.items() if v is not None}
-        binding_keys = tuple(cleaned_bindings.keys())
-        bind_contextvars(**cleaned_bindings)
-
         try:
-            yield op_context
+            yield _observability_context.get()
         finally:
-            _operation_stack.reset(stack_token)
-            self._restore_context(previous, binding_keys)
+            _observability_context.reset(token)
 
-    def metadata(
-        self,
-        request_id: Optional[str] = None,
-        operation_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        context = get_contextvars()
+    def metadata(self, *, event_id: Optional[str] = None) -> Dict[str, Any]:
+        """Build metadata for an event, generating an event identifier if needed."""
+        context = _observability_context.get()
         metadata: Dict[str, Any] = {}
-
-        session_id = context.get("session_id") or context.get("thread_id")
-        if session_id:
-            metadata["session_id"] = session_id
-        conversation_id = context.get("conversation_id")
-        if conversation_id:
-            metadata["conversation_id"] = conversation_id
-        thread_id = context.get("thread_id")
-        if thread_id:
-            metadata["thread_id"] = thread_id
-        trace_id = context.get("trace_id")
-        if trace_id:
-            metadata["trace_id"] = trace_id
-        active_request = context.get("request_id")
-        if active_request:
-            metadata["request_id"] = active_request
-        active_operation = context.get("operation_id")
-        if active_operation:
-            metadata["operation_id"] = active_operation
-        parent_operation_id = context.get("parent_operation_id")
-        if parent_operation_id:
-            metadata["parent_operation_id"] = parent_operation_id
-        operation_type = context.get("operation_type")
-        if operation_type:
-            metadata["operation_type"] = operation_type
-        if request_id:
-            metadata["request_id"] = request_id
-        if operation_id:
-            metadata["operation_id"] = operation_id
+        if context:
+            metadata["session_id"] = context.session_id
+            if context.request_id:
+                metadata["request_id"] = context.request_id
+        metadata["event_id"] = event_id or self.new_event_id()
         return metadata
 
     def event(
@@ -186,11 +76,10 @@ class Observability:
         event_type: EventType,
         data: Any,
         *,
-        request_id: Optional[str] = None,
-        operation_id: Optional[str] = None,
+        event_id: Optional[str] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> Event:
-        metadata = self.metadata(request_id=request_id, operation_id=operation_id)
+        metadata = self.metadata(event_id=event_id)
         if extra_metadata:
             metadata.update(extra_metadata)
         return Event(event_type, data, metadata)
@@ -200,9 +89,8 @@ class Observability:
         event_type: EventType,
         data: Any,
         *,
-        thread: Optional["Thread"] = None,  # Forward reference for type checking
-        request_id: Optional[str] = None,
-        operation_id: Optional[str] = None,
+        thread: Optional["Thread"] = None,
+        event_id: Optional[str] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> Event:
         from .core import Thread  # Local import to avoid circular dependency
@@ -210,8 +98,7 @@ class Observability:
         event = self.event(
             event_type,
             data,
-            request_id=request_id,
-            operation_id=operation_id,
+            event_id=event_id,
             extra_metadata=extra_metadata,
         )
         if thread:
@@ -255,10 +142,7 @@ class Observability:
             result["cached_tokens"] = cached_tokens
             result["cache_hit"] = cached_tokens > 0
 
-        if (
-            result.get("latency_ms", 0) > 0
-            and total_tokens is not None
-        ):
+        if result.get("latency_ms", 0) > 0 and total_tokens is not None:
             latency_seconds = result["latency_ms"] / 1000.0
             if latency_seconds > 0:
                 result["tokens_per_second"] = round(total_tokens / latency_seconds, 3)
@@ -294,6 +178,5 @@ class Observability:
 
 __all__ = [
     "Observability",
-    "ObservabilityState",
-    "OperationContext",
+    "ObservabilityContext",
 ]

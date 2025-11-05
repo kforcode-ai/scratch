@@ -96,9 +96,21 @@ python demos/demo_multi_llm_providers.py
 ```
 
 ## 🔍 Observability
-- Structured JSON logging now binds `session_id`, `request_id`, and `operation_id` context by default (see `miniagent_framework/core/logging.py`).
-- LLM call events now include provider token usage metrics and latency budgets when available.
-- Tool executions record duration and flag low-signal outputs to surface weak tool responses quickly.
+- Structured events always include `session_id` (conversation), `request_id` (turn), and a generated `event_id` for the atomic event.
+- LLM call events merge provider token usage metrics and latency figures when available.
+- Tool executions record duration and flag low-signal outputs so weak responses surface quickly.
+
+### Observability runtime
+
+`miniagent_framework/core/observability.py` now keeps just two lightweight scopes:
+- `Observability.session_scope(session_id=...)` binds a conversation-wide identifier.
+- `Observability.request_scope(request_id)` nests a single `Agent.run(...)` turn under the active session.
+- `Observability.emit(...)` creates `Event` objects with the current scope metadata and optional `event_id` for the most granular telemetry. Use `Observability.new_event_id()` when you need to reuse an event id across multiple emissions.
+
+**Identifier semantics**
+- `session_id` names the long-lived conversation container (mirrors `Thread.id`).
+- `request_id` marks one user turn handled by `Agent.run(...)`.
+- `event_id` is the atomic telemetry identifier used for planning steps, LLM calls, tool executions, and any other discrete event.
 
 ## ✨ Key Features
 
@@ -196,9 +208,9 @@ Every interaction carries structured identifiers so you can trace the agent end-
 
 | Concept | Purpose | Where to Inspect |
 |---------|---------|------------------|
-| `session_id` / `thread_id` | Conversation identifier spanning multiple user turns. `session_id` is bound into logs; `thread_id` is the persisted value on the `Thread`. | `Thread.id`, event metadata, structured logs |
-| `request_id` | Unique to a single `agent.run(...)` call. Binds plan generation, tool calls, and the final response for that user message. | Event metadata, structlog context (auto-bound) |
-| `operation_id` / `parent_operation_id` | Identifies individual operations within a request (e.g., decision LLM call, streaming pass, tool execution) and the parent that scheduled them. | Event metadata, log entries emitted inside the operation scope |
+| `session_id` | Conversation identifier spanning multiple user turns; maps to the persisted `Thread.id`. | `Thread.id`, event metadata, logs |
+| `request_id` | Unique to a single `agent.run(...)` call, covering planning, tool use, and the final response. | Event metadata, request scope |
+| `event_id` | Atomic telemetry identifier per event (planning step, LLM call, tool execution, stream chunk, etc.). | Event metadata, debugging logs |
 | `Event` | Structured record (type, timestamp, content, metadata) emitted for every lifecycle change—planning, tool usage, streaming, clarifications, etc. | `Thread.events`, `StreamCallback` handlers |
 | Session | Higher-level conversation container. By default the `Thread` acts as the in-memory session; Redis/SQLite extensions persist it across processes. | `miniagent_framework/core/core.py`, `extensions/session.py` |
 
