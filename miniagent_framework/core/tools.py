@@ -1,7 +1,7 @@
 """
 Tool system with registry, execution, error handling, and token optimization
 """
-from typing import Dict, Any, Optional, Callable, List, Union
+from typing import Dict, Any, Optional, Callable, List
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 import asyncio
@@ -660,14 +660,7 @@ class WebSearchTool(Tool):
             },
             "required": ["query"]
         }
-    
-    def get_schema(self) -> Dict:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "parameters": self.parameters
-        }
-    
+
     async def execute(self, query: str) -> ToolResult:
         """Execute web search"""
         if not self.api_key:
@@ -741,13 +734,6 @@ class DateTimeTool(Tool):
             "required": []
         }
 
-    def get_schema(self) -> Dict:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "parameters": self.parameters
-        }
-
     async def execute(
         self,
         timezone: Optional[str] = None,
@@ -812,14 +798,7 @@ class KnowledgeBaseTool(Tool):
             },
             "required": ["topic"]
         }
-    
-    def get_schema(self) -> Dict:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "parameters": self.parameters
-        }
-    
+
     async def execute(self, topic: str) -> ToolResult:
         """Search knowledge base"""
         # Find matching topics

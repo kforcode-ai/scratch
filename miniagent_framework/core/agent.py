@@ -194,7 +194,11 @@ class Agent:
             "name": "web_search",
             "arguments": {"query": query},
             "note": "Fallback search after empty knowledge_base result",
+            "from_llm": False,
+            "source": "fallback_web_search",
+            "event_id": None,
         }
+        fallback_call["event_id"] = fallback_call["id"]
         self._queue_tool_calls(thread, [fallback_call])
         fallback_markers.append(marker)
         logger.info(
@@ -558,6 +562,38 @@ class Agent:
     ) -> ActionResult:
         pending_call = self._pop_next_tool_call(thread)
         if pending_call:
+            if not pending_call.get("from_llm", False):
+                arguments_obj = pending_call.get("arguments", {})
+                if isinstance(arguments_obj, str):
+                    arguments_str = arguments_obj
+                else:
+                    try:
+                        arguments_str = json.dumps(arguments_obj, ensure_ascii=False)
+                    except (TypeError, ValueError):
+                        arguments_str = str(arguments_obj)
+                tool_name = pending_call.get("name") or "unknown_tool"
+                assistant_message = Message(
+                    "assistant",
+                    content="",
+                    metadata={
+                        "internal": True,
+                        "type": "tool_call",
+                        "include_in_prompt": True,
+                        "source": pending_call.get("source", "pending_queue"),
+                        "tools": [tool_name],
+                    },
+                    tool_calls=[
+                        {
+                            "id": pending_call.get("id"),
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": arguments_str,
+                            },
+                        }
+                    ],
+                )
+                thread.add_message(assistant_message)
             logger.info(
                 "agent.intent.selected",
                 action="tool",
@@ -977,6 +1013,8 @@ class Agent:
                     "arguments": arguments_dict,
                     "event_id": call_id,
                     "note": raw_call.get("note"),
+                    "from_llm": True,
+                    "source": "llm_tool_call",
                 }
             )
 
@@ -1448,11 +1486,6 @@ class Agent:
             system_content += (
                 "\n\nCompose the final user-facing answer summarizing tool evidence. Respond as JSON with keys 'message', optional 'summary', and include 'clarification': true if you still need more information."
             )
-        elif mode == "clarification":
-            system_content += (
-                "\n\nAsk a concise question to obtain the missing information before proceeding."
-            )
-
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_content}
         ]
@@ -1485,38 +1518,6 @@ class Agent:
             description = schema.get("description", "")
             lines.append(f"<tool> {schema.get('name')} : {description}")
         return "\n".join(lines)
-
-    async def _generate_clarification_response(
-        self,
-        reason: Optional[str],
-        thread: Thread,
-        context: Optional[str],
-        iteration: int,
-    ) -> str:
-        prompt = (
-            "You need to ask the user for clarification before proceeding. "
-            "Craft a concise, polite question that explains what information you need next."
-        )
-        if reason:
-            prompt += f" Reason for clarification: {reason}."
-        messages = self._build_messages(
-            prompt, thread, context, iteration, mode="clarification"
-        )
-        try:
-            response = await self._llm_json_call(messages, FinalResponseModel, thread)
-            message = response.message
-            if isinstance(message, dict):
-                message = json.dumps(message, ensure_ascii=False)
-            return message
-        except Exception:
-            raw = await self.llm.complete(
-                messages=messages,
-                temperature=self.config.temperature,
-                max_tokens=256,
-                stream=False,
-                tools=None,
-            )
-            return raw if isinstance(raw, str) else json.dumps(raw)
 
     def _should_generate_plan(
         self,
