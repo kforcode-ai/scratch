@@ -6,7 +6,7 @@ import asyncio
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
-from ..core.agent import Agent, AgentConfig
+from ..core.plan_agent import Agent, AgentConfig
 from ..core.core import Thread, Message
 from .redis_client import RedisSessionManager, RedisConfig, get_redis_manager
 from ..core.events import Event, EventType, StreamCallback

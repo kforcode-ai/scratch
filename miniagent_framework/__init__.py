@@ -6,7 +6,7 @@ MiniAgent Framework - Simple, powerful agent framework
 from miniagent_framework.core import (
     Agent,
     AgentConfig,
-    AgentFactory,
+    # AgentFactory,
     Thread,
     Message,
     StreamCallback,

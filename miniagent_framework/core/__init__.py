@@ -3,7 +3,7 @@ MiniAgent - A simple, powerful agent framework
 Inspired by HICA and BAML, focusing on simplicity and readability
 """
 
-from .agent import Agent, AgentConfig, AgentFactory
+from .agent import Agent, AgentConfig
 from .core import Thread, Message
 from .tools import Tool, ToolRegistry, ToolResult
 from .llm import LLMClient, LLMProvider, RetryPolicy, RetryStrategy
@@ -16,7 +16,7 @@ __all__ = [
     "Agent",
     "Thread", 
     "AgentConfig",
-    "AgentFactory",
+    # "AgentFactory",
     "Tool",
     "ToolRegistry",
     "ToolResult",
