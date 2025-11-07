@@ -16,7 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from miniagent_framework.core import Thread  # noqa: E402
+from miniagent_framework.core import Agent, AgentConfig, AgentFactory, Thread  # noqa: E402
 from miniagent_framework.core.tools import (  # noqa: E402
     ToolRegistry,
     KnowledgeBaseTool,
@@ -26,7 +26,12 @@ from miniagent_framework.core.tools import (  # noqa: E402
     ToolResult,
 )
 from miniagent_framework.core.events import EventType  # noqa: E402
-from miniagent_framework.core.agent import Agent, AgentConfig  # noqa: E402
+
+
+DEFAULT_CREATOR_PROMPT = (
+    "You are the MiniAgent demo assistant. Be concise, cite tool outputs when relevant, "
+    "and keep responses user friendly."
+)
 
 
 class SampleGlossaryTool(Tool):
@@ -107,6 +112,33 @@ def build_toolbox() -> ToolRegistry:
     registry.register(SampleGlossaryTool())
     registry.register(WebSearchTool())  # Gracefully reports if TAVILY_API_KEY is missing
     return registry
+
+
+def build_agent(args: argparse.Namespace) -> tuple[Agent, ToolRegistry]:
+    toolbox = build_toolbox()
+    config = AgentConfig()
+    if args.provider:
+        config.provider = args.provider
+    if args.model:
+        config.model = args.model
+    if args.temperature is not None:
+        config.temperature = args.temperature
+    if args.max_tokens is not None:
+        config.max_tokens = args.max_tokens
+    if args.tool_timeout is not None:
+        config.tool_timeout = args.tool_timeout
+    if args.llm_timeout is not None:
+        config.llm_timeout = args.llm_timeout
+    if args.stream is not None:
+        config.stream_by_default = args.stream
+
+    factory = AgentFactory(
+        base_config=config,
+        base_prompt=config.system_prompt,
+        creator_prompt=DEFAULT_CREATOR_PROMPT,
+    )
+    agent = factory.create(tool_registry=toolbox)
+    return agent, toolbox
 
 
 def attach_console_observers(agent: Agent) -> None:
@@ -210,24 +242,7 @@ async def main() -> None:
     args = parse_args()
     show_intro()
 
-    toolbox = build_toolbox()
-    config = AgentConfig()
-    if args.provider:
-        config.provider = args.provider
-    if args.model:
-        config.model = args.model
-    if args.temperature is not None:
-        config.temperature = args.temperature
-    if args.max_tokens is not None:
-        config.max_tokens = args.max_tokens
-    if args.tool_timeout is not None:
-        config.tool_timeout = args.tool_timeout
-    if args.llm_timeout is not None:
-        config.llm_timeout = args.llm_timeout
-    if args.stream is not None:
-        config.stream_by_default = args.stream
-
-    agent = Agent(config=config, tools=toolbox)
+    agent, toolbox = build_agent(args)
     attach_console_observers(agent)
     thread = Thread()
     extra_context: Optional[str] = None
@@ -264,9 +279,9 @@ async def main() -> None:
             user_input,
             thread=thread,
             context=extra_context,
-            stream=config.stream_by_default,
+            stream=agent.config.stream_by_default,
         )
-        if config.stream_by_default:
+        if agent.config.stream_by_default:
             if response:
                 print(f"\nAgent (final) > {response}")
         else:

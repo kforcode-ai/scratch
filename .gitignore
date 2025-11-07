@@ -66,3 +66,5 @@ docs/*
 *.cursor/*
 
 prds/*
+
+config/*

@@ -6,7 +6,8 @@ MiniAgent Framework - Simple, powerful agent framework
 from miniagent_framework.core import (
     Agent,
     AgentConfig,
-    # AgentFactory,
+    AgentFactory,
+    compose_system_prompt,
     Thread,
     Message,
     StreamCallback,
@@ -68,6 +69,7 @@ __all__ = [
     "Agent",
     "AgentConfig", 
     "AgentFactory",
+    "compose_system_prompt",
     "Thread",
     "Message",
     "StreamCallback",
