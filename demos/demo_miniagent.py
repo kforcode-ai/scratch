@@ -7,13 +7,15 @@ import json
 import os
 import sys
 import textwrap
-from typing import Dict, Any, List
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 
 # Add parent directory to path to import framework
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from miniagent_framework.core import Agent, AgentConfig, Thread
+from miniagent_framework.core import Thread
+from miniagent_framework.core.plan_agent import Agent, AgentConfig
 from miniagent_framework.core.tools import (
     ToolRegistry,
     KnowledgeBaseTool,
@@ -30,44 +32,74 @@ load_dotenv()
 
 
 class MarketInsightsTool(Tool):
-    """Fetch recent market commentary for a ticker using web search."""
+    """Fetch recent market commentary for a ticker using the shared WebSearchTool."""
 
     def __init__(self, web_search_tool: WebSearchTool):
         self.name = "market_insights"
         self.description = (
-            "Collect recent price/insight snippets for a ticker symbol using web search."
+            "Summarize the latest context for an index or ticker with date, region, and research links."
         )
         self.parameters = {
             "type": "object",
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "Ticker symbol (e.g., 'AAPL', 'NIFTY BANK', 'ABBOTINDIA').",
+                    "description": "Ticker symbol or index (e.g., AAPL, RELIANCE, NIFTY 50).",
                 },
-                "scope": {
+                "country": {
                     "type": "string",
-                    "description": "Optional geographic or market scope to bias the results.",
+                    "description": "Jurisdiction to focus on (e.g., India, United States, Europe).",
+                },
+                "as_of_date": {
+                    "type": "string",
+                    "description": (
+                        "Date/time the user cares about (ISO format or natural phrases like 'today'). "
+                        "Always set this when the user requests recent data."
+                    ),
+                },
+                "focus": {
+                    "type": "string",
+                    "description": "Emphasis for the search (price action, sentiment, macro outlook, etc.).",
+                },
+                "include_resources": {
+                    "type": "boolean",
+                    "description": "Include curated research/news sources for ongoing tracking.",
                 },
             },
             "required": ["symbol"],
         }
         self._web_search = web_search_tool
 
-    async def execute(self, symbol: str, scope: str = "") -> ToolResult:
+    async def execute(
+        self,
+        symbol: str,
+        country: str = "",
+        as_of_date: Optional[str] = None,
+        focus: str = "",
+        include_resources: bool = True,
+    ) -> ToolResult:
         cleaned = symbol.strip()
         if not cleaned:
             return ToolResult(
                 success=False,
-                error="Ticker symbol is required.",
-                display_content="❌ Please provide a symbol, e.g., `ABBOTINDIA`.",
+                error="Symbol is required.",
+                display_content="❌ Provide a ticker symbol like AAPL, RELIANCE, or NIFTY 50.",
             )
 
-        scope_hint = scope.strip() or "stock market"
-        query = f"{cleaned} stock latest performance {scope_hint}"
+        country_hint = country.strip() or "global"
+        focus_hint = focus.strip() or "price action"
+        date_info = self._resolve_date(as_of_date)
+        query_parts = [
+            cleaned,
+            "market insights",
+            country_hint,
+            date_info["label"],
+            focus_hint,
+        ]
+        query = " ".join(part for part in query_parts if part)
 
         search_result = await self._web_search.execute(query=query)
         if not search_result.success:
-            # Bubble up the failure so the agent can handle it.
             return ToolResult(
                 success=False,
                 error=search_result.error,
@@ -75,26 +107,43 @@ class MarketInsightsTool(Tool):
                 metadata={"source_tool": "web_search"},
             )
 
-        sources: List[Dict[str, Any]] = search_result.data or []
-        top_sources = sources[:3]
+        sources = (search_result.data or [])[:3]
+        timestamp_label = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        display_lines = [
+            f"🔍 Market insights for {cleaned.upper()}",
+            f"• Scope: {country_hint.title()} · As of: {date_info['label']} · Focus: {focus_hint}",
+            f"• Generated: {timestamp_label}",
+            "",
+        ]
 
-        display_lines = [f"🔍 Market insights for {cleaned.upper()}:"]
-        for idx, src in enumerate(top_sources, start=1):
+        for idx, src in enumerate(sources, start=1):
             title = src.get("title") or "Untitled"
-            content = (src.get("content") or "").strip()
-            brief = (content[:220] + "...") if len(content) > 220 else content
+            snippet = (src.get("content") or "").strip()
+            brief = (snippet[:220] + "...") if len(snippet) > 220 else snippet
             url = src.get("url") or "N/A"
             display_lines.append(f"{idx}. {title}\n   {brief}\n   {url}")
 
-        if len(display_lines) == 1:
-            display_lines.append("No recent market commentary found.")
+        if len(display_lines) == 4:
+            display_lines.append("No recent commentary detected.")
+
+        resource_links = []
+        if include_resources:
+            resource_links = self._reference_links_for(country_hint)
+            if resource_links:
+                display_lines.append("\n📚 Suggested follow-up sources:")
+                for ref in resource_links:
+                    display_lines.append(f"- {ref['name']}: {ref['url']} ({ref['description']})")
 
         payload = {
             "symbol": cleaned.upper(),
-            "sources": top_sources,
+            "sources": sources,
             "query": query,
+            "country": country_hint,
+            "as_of_date": date_info,
+            "focus": focus_hint,
+            "generated_at": timestamp_label,
+            "resources": resource_links,
         }
-
         return ToolResult(
             success=True,
             data=payload,
@@ -102,6 +151,100 @@ class MarketInsightsTool(Tool):
             llm_content=json.dumps(payload),
             metadata={"source_tool": "web_search"},
         )
+
+    def _reference_links_for(self, country_hint: str) -> List[Dict[str, str]]:
+        country_hint = country_hint.lower()
+        global_links = [
+            {
+                "name": "Investing.com",
+                "url": "https://www.investing.com/",
+                "description": "Quotes, earnings calendar, analyst sentiment.",
+            },
+            {
+                "name": "Trading Economics",
+                "url": "https://tradingeconomics.com/",
+                "description": "Macro releases, FX, and rates dashboards.",
+            },
+            {
+                "name": "SEC EDGAR",
+                "url": "https://www.sec.gov/edgar/search/",
+                "description": "US filings and disclosures.",
+            },
+        ]
+        india_links = [
+            {
+                "name": "NSE Announcements",
+                "url": "https://www.nseindia.com/companytracker/corporateAnnouncements",
+                "description": "Official Indian exchange disclosures.",
+            },
+            {
+                "name": "BSE Corporate Filings",
+                "url": "https://www.bseindia.com/corporates/ann.aspx",
+                "description": "BSE announcements and board updates.",
+            },
+            {
+                "name": "RBI Press Releases",
+                "url": "https://rbi.org.in/scripts/bs_viewcontent.aspx?Id=2009",
+                "description": "Policy commentary impacting Indian markets.",
+            },
+        ]
+        europe_links = [
+            {
+                "name": "ESMA Register",
+                "url": "https://registers.esma.europa.eu/publication/",
+                "description": "Regulatory notices for EU-listed issuers.",
+            },
+            {
+                "name": "ECB SDW",
+                "url": "https://sdw.ecb.europa.eu/",
+                "description": "Euro-area macro indicators and rates.",
+            },
+        ]
+
+        if "india" in country_hint or "nifty" in country_hint:
+            return global_links + india_links
+        if any(x in country_hint for x in ("europe", "uk", "eu")):
+            return global_links + europe_links
+        if any(x in country_hint for x in ("us", "usa", "america", "nasdaq", "dow", "s&p", "sp500")):
+            return global_links
+        return global_links
+
+    def _resolve_date(self, raw: Optional[str]) -> Dict[str, str]:
+        """Normalize user-provided timestamps to a UTC label + ISO string."""
+
+        def _format(dt: datetime) -> Dict[str, str]:
+            dt_utc = dt.astimezone(timezone.utc)
+            return {
+                "label": dt_utc.strftime("%Y-%m-%d %H:%M UTC"),
+                "iso": dt_utc.isoformat(),
+                "source": raw or "auto_now",
+            }
+
+        if not raw:
+            return _format(datetime.now(timezone.utc))
+
+        normalized = raw.strip().lower()
+        if normalized in {"today", "now", "latest", "current"}:
+            return _format(datetime.now(timezone.utc))
+
+        parse_attempts = [raw, raw.replace("Z", "+00:00") if "Z" in raw else raw]
+        for candidate in parse_attempts:
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return _format(parsed)
+            except ValueError:
+                continue
+
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y"):
+            try:
+                parsed = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+                return _format(parsed)
+            except ValueError:
+                continue
+
+        return _format(datetime.now(timezone.utc))
 
 
 def print_divider(char: str = "-") -> None:
@@ -202,35 +345,62 @@ async def main(args: argparse.Namespace):
     registry = ToolRegistry()
 
     # Add knowledge base with more content
-    registry.register(KnowledgeBaseTool({
-        "pricing": """📊 **Pricing Plans:**
-• Starter: $9/month (10 users, 100GB storage)
-• Professional: $29/month (50 users, 1TB storage)
-• Enterprise: Custom pricing (unlimited users, custom features)
-All plans include SSL, daily backups, and 99.9% uptime guarantee.""",
-
-        "features": """✨ **Key Features:**
-• Real-time collaboration and document sharing
-• Advanced security with 2FA and SSO
-• Analytics dashboard with custom reports
-• 1000+ integrations (Slack, Teams, Google, etc.)
-• Mobile apps for iOS and Android
-• API access (Pro and Enterprise)""",
-
-        "support": """🎧 **Support Options:**
-• 24/7 email support (all plans)
-• Live chat support (Professional+)
-• Phone support (Enterprise)
-• Dedicated account manager (Enterprise)
-• Community forum and knowledge base""",
-
-        "refund": """💰 **Refund Policy:**
-• 30-day money-back guarantee
-• No questions asked
-• Full refund for first-time customers
-• Pro-rated refunds for annual plans"""
-    }))
-
+    registry.register(KnowledgeBaseTool(
+            knowledge={
+                "miniagent_overview": textwrap.dedent(
+                    """\
+                    MiniAgent is a lightweight yet production-ready agent runtime. It ships two execution modes:
+                    (1) Slim Agent – a single-loop executor focused on fast tool decisions.
+                    (2) Planner Agent – a structured planner that drafts steps, executes tools, and summarizes.
+                    The framework is written in Python, exposes pluggable tools, and integrates tightly with
+                    StreamCallback-based observability hooks."""
+                ),
+                "miniagent_objective": textwrap.dedent(
+                    """\
+                    Objective: make it simple for product teams to embed autonomous reasoning without scaffolding an entire LLM stack.
+                    Core promises:
+                    • ergonomic API surface (Agent, Thread, ToolRegistry)
+                    • deterministic control over tool usage and retries
+                    • observability out of the box (event stream, metrics snapshot)
+                    • drop-in demos plus Streamlit playground for experimentation."""
+                ),
+                "miniagent_principles": textwrap.dedent(
+                    """\
+                    Design principles:
+                    1. Human-first transparency — every tool call and LLM decision is emitted as an event.
+                    2. Composability — agents, tools, and LLM providers are swappable dataclasses.
+                    3. Production empathy — clear timeouts, retry policies, and thread serialization support.
+                    4. Minimal magic — default prompts are explicit and easy to override."""
+                ),
+                "thread_definition": textwrap.dedent(
+                    """\
+                    A Thread captures the ordered history of Message objects (user, assistant, and tool replies).
+                    MiniAgent stores events on the thread as well, enabling resumable conversations and debugging.
+                    Threads expose metadata fields for plan summaries, last request IDs, and other runtime hints."""
+                ),
+                "telemetry_observability": textwrap.dedent(
+                    """\
+                    Observability is driven by StreamCallback + Observability helper:
+                    • StreamCallback lets you register handlers for AGENT_THINKING, TOOL_RESULT, STREAM_CHUNK, etc.
+                    • Observability scopes events per session/request and appends them to the thread.
+                    • Plan Agent also emits PLAN_GENERATING and PLAN_STEP events for UI visualizations."""
+                ),
+                "pricing": textwrap.dedent(
+                    """\
+                    This playground assumes three SaaS tiers:
+                    • Starter $9/mo (10 seats, 100GB, community support)
+                    • Professional $29/mo (50 seats, 1 TB, live chat, API access)
+                    • Enterprise — custom pricing, unlimited seats, SSO + dedicated TAM."""
+                ),
+                "support": textwrap.dedent(
+                    """\
+                    Support matrix:
+                    • Starter – 24/7 email + public docs
+                    • Professional – adds live chat and quarterly success reviews
+                    • Enterprise – phone hotline, dedicated account manager, private Slack channel, and on-call escalation."""
+                ),
+            }
+        ))
     # Additional curated tools for richer chat scenarios
     web_search_tool = WebSearchTool()
     registry.register(web_search_tool)
@@ -329,14 +499,18 @@ All plans include SSL, daily backups, and 99.9% uptime guarantee.""",
         data = event.content or {}
         tool = data.get("tool")
         args = data.get("arguments", {})
-        print(f"🔧 Starting {tool} with {args}")
+        arg_display = json.dumps(args, indent=2, ensure_ascii=False) if args else "{}"
+        print(f"🔧 Starting {tool} with:")
+        print(textwrap.indent(arg_display, "      "))
 
     def tool_end_handler(event):
         data = event.content or {}
         tool = data.get("tool")
         success = data.get("success")
+        duration = data.get("duration_ms")
         icon = "✅" if success else "⚠️"
-        print(f"{icon} {tool} finished")
+        timing = f" in {duration} ms" if duration is not None else ""
+        print(f"{icon} {tool} finished{timing}")
 
     def tool_progress_handler(event):
         data = event.content or {}
@@ -359,8 +533,15 @@ All plans include SSL, daily backups, and 99.9% uptime guarantee.""",
         payload = event.content or {}
         success = payload.get("success")
         display = payload.get("display") or payload.get("llm")
+        metadata = payload.get("metadata") or {}
         icon = "   ✓" if success else "   ✗"
-        print(f"{icon} Tool completed" if success else f"{icon} Tool failed")
+        details: List[str] = []
+        if metadata.get("duration_ms") is not None:
+            details.append(f"{metadata['duration_ms']} ms")
+        if metadata.get("quality"):
+            details.append(f"quality: {metadata['quality']}")
+        suffix = f" ({', '.join(details)})" if details else ""
+        print(f"{icon} Tool completed{suffix}" if success else f"{icon} Tool failed{suffix}")
         if not success and payload.get("error"):
             print(textwrap.indent(f"Error: {payload['error']}", "      "))
         if display:
